@@ -1,0 +1,51 @@
+{
+  "model_name": "GLM-5.3-Flash",
+  "exe": "/path/to/Strata-GLM-AMD/build-hip/strata-glm5",
+  "cwd": "/path/to/Strata-GLM-AMD",
+  "args": [
+    "--serve",
+    "--gguf",
+    "/path/to/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf",
+    "--mtp",
+    "/path/to/GLM-5.3-Flash-MTP-Q4_K.gguf",
+    "--devices",
+    "0",
+    "--expert-budget-gib",
+    "17.9",
+    "--profile",
+    "/path/to/strata-data/glm53/profile_chat.txt",
+    "--window",
+    "8",
+    "--prefill-window",
+    "4096",
+    "--spec",
+    "2",
+    "--profile-save",
+    "/path/to/strata-data/glm53/profile_chat_1gpu.txt",
+    "--ctx",
+    "262144",
+    "--attn",
+    "lod",
+    "--lod-top",
+    "128",
+    "--lod-top-decode",
+    "64",
+    "--pin-gib",
+    "96"
+  ],
+  "tokenizer": "/path/to/strata-data/glm53/pack/tokenizer",
+  "log": "/path/to/Strata-GLM-AMD/strata-glm53-1gpu.log",
+  "gpu": [
+    0
+  ],
+  "backend": "hip",
+  "engine_silence_s": 600,
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "STRATA_GLM5_PF_BUFS": "2",
+    "STRATA_GLM5_LOD_ROUTE": "pool",
+    "STRATA_GLM5_LOD_TOP_POOLS": "1024",
+    "STRATA_GLM5_LOD_NOSUM": "1"
+  },
+  "parallel": 1
+}
