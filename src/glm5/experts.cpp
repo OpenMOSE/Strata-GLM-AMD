@@ -29,6 +29,7 @@ void check(cudaError_t e, const char* what) {
 }  // namespace
 
 ExpertStore::ExpertStore(const Model& m, const ExpertStoreConfig& cfg) {
+    if (const char* rl = std::getenv("STRATA_GLM5_ROUTE_LOG")) route_log_ = std::fopen(rl, "w");
     admit_window_ = cfg.admit_window;
     const HParams& hp = m.hp();
     if (cfg.budget_bytes.size() != cfg.devices.size()) throw std::runtime_error("ExpertStore: one budget per device");
@@ -88,6 +89,7 @@ ExpertStore::ExpertStore(const Model& m, const ExpertStoreConfig& cfg) {
     }
     plan(m, cfg);
     load(m, cfg);
+    init_loans(m.hp().n_layer);
 }
 
 ExpertStore::~ExpertStore() {
@@ -163,7 +165,7 @@ void ExpertStore::plan(const Model& m, const ExpertStoreConfig& cfg) {
             int il, e;
             unsigned c;
             if (std::sscanf(line.c_str(), "%d %d %u", &il, &e, &c) != 3) continue;
-            if (il >= hp.n_dense_lead && il < hp.n_layer && e >= 0 && e < hp.n_expert) ranked.emplace_back(c, il, e);   // the trunk's layers only
+            if (il >= hp.n_dense_lead && il < hp.n_layer && e >= 0 && e < hp.n_expert) { ranked.emplace_back(c, il, e); counts_[(size_t) il][(size_t) e] = c; }   // the trunk's layers only; the counts carry on from the profile (a save accumulates sessions)
         }
         have_profile = !ranked.empty();
         std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
@@ -205,6 +207,14 @@ void ExpertStore::plan(const Model& m, const ExpertStoreConfig& cfg) {
         E.n_slots = n_slots[(size_t) il];
         E.expert_of = admitted[(size_t) il];
         E.slot_last_used.assign((size_t) E.n_slots, 0u);
+    }
+    if (route_log_) {
+        for (int il = hp.n_dense_lead; il < NL; ++il) {
+            std::fprintf(route_log_, "S %d %d", il, layers_[(size_t) il].n_slots);
+            for (int e : layers_[(size_t) il].expert_of) std::fprintf(route_log_, " %d", e);
+            std::fprintf(route_log_, "\n");
+        }
+        std::fflush(route_log_);
     }
     if (cfg.verbose) {
         std::fprintf(stderr, "glm5 experts: %d of %d resident (%s)", n_resident_, n_total_, have_profile ? "profile ranking" : "no profile: lowest ids first");
@@ -607,6 +617,7 @@ void ExpertStore::finish_staged(LayerExperts& E, size_t di, int* miss_slot, std:
 
 int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, int* miss_slot, int* miss_out, int max_swaps) {
     LayerExperts& E = layers_[(size_t) il];
+    if (route_log_) { std::fprintf(route_log_, "T %u %d", tok, il); for (int j = 0; j < n; ++j) std::fprintf(route_log_, " %d", ids[j]); std::fprintf(route_log_, "\n"); }
     const size_t di = (size_t) device_index_of_layer(il);
     cudaStream_t cs = static_cast<cudaStream_t>(copy_streams_[di]);
     std::vector<std::function<void()>> jobs;
@@ -708,14 +719,194 @@ void ExpertStore::init_cpu(const Model& m) {
     hq_.assign(64, std::vector<uint8_t>(h_max + 64));
     y_pin_rows_ = NL * 64;
     void* p = nullptr;
-    check(cudaHostAlloc(&p, (size_t) y_pin_rows_ * hp.n_embd * 4, cudaHostAllocPortable), "cudaHostAlloc y_pin");
+    check(cudaHostAlloc(&p, (size_t) y_pin_rows_ * hp.n_embd * 4, cudaHostAllocPortable | cudaHostAllocMapped), "cudaHostAlloc y_pin");
     y_pin_ = static_cast<float*>(p);
+    { void* dp = nullptr; if (cudaHostGetDevicePointer(&dp, p, 0) == cudaSuccess) y_pin_dev_ = static_cast<float*>(dp); else cudaGetLastError(); }
     std::fprintf(stderr, "glm5 experts: decode misses computed on the CPU (ggml-cpu, %d threads)\n", cpu_threads_);
+}
+
+void ExpertStore::init_loans(int n_layers) {
+    n_layers = (int) layers_.size();   // every layer entry (the MTP layer included: its tables stay empty)
+    loan_on_ = wide_ && !win_bufs_.empty() && !(std::getenv("STRATA_GLM5_LOAN") && std::atoi(std::getenv("STRATA_GLM5_LOAN")) == 0);
+    if (std::getenv("STRATA_GLM5_LOAN_PER_WIN")) loan_per_win_ = std::max(0, std::atoi(std::getenv("STRATA_GLM5_LOAN_PER_WIN")));
+    // default: loans only from the PCIe-staged misses (their blob crosses the memory bus once, the loan is a device copy);
+    // STRATA_GLM5_LOAN_H2D=1 also copies the CPU-served misses from the host (a second read of each: measured slower)
+    loan_h2d_ = std::getenv("STRATA_GLM5_LOAN_H2D") && std::atoi(std::getenv("STRATA_GLM5_LOAN_H2D")) != 0;
+    for (auto& E : layers_) { E.loan_of.assign(E.slot_of.size(), -1); E.loan_live.assign(E.slot_of.size(), 0); }
+    if (!loan_on_) return;
+    // the slot pitch: the most common layer stride (layers with a larger one do not loan)
+    std::map<uint64_t, int> strides;
+    for (int il = 0; il < n_layers; ++il) if (layers_[(size_t) il].n_slots || layers_[(size_t) il].stride) ++strides[layers_[(size_t) il].stride];
+    for (const auto& kv : strides) if (kv.second >= strides[loan_stride_]) loan_stride_ = kv.first;
+    loan_ptr_h_.assign(devices_.size(), {}); loan_ptr_d_.assign(devices_.size(), nullptr);
+    loan_holder_.assign(devices_.size(), {}); loan_last_used_.assign(devices_.size(), {}); loan_free_.assign(devices_.size(), {});
+    loan_clock_.assign(devices_.size(), 0);
+    int total = 0;
+    for (size_t d = 0; d < devices_.size(); ++d) {
+        check(cudaSetDevice(devices_[d]), "cudaSetDevice");
+        uint64_t ring = 0;
+        for (int il = 0; il < n_layers; ++il) {
+            const LayerExperts& E = layers_[(size_t) il];
+            if (E.device != devices_[d] || E.n_slots == 0) continue;
+            ring = std::max(ring, (uint64_t) ((int) E.slot_of.size() - E.n_slots) * E.stride);
+        }
+        for (uint8_t* buf : win_bufs_[d])
+            for (uint64_t off = 0; off + loan_stride_ <= ring; off += loan_stride_) loan_ptr_h_[d].push_back(buf + off);
+        const int n = (int) loan_ptr_h_[d].size();
+        loan_holder_[d].assign((size_t) n, {-1, -1}); loan_last_used_[d].assign((size_t) n, 0u);
+        for (int j = n - 1; j >= 0; --j) loan_free_[d].push_back(j);
+        void* p = nullptr;
+        check(cudaMalloc(&p, (size_t) std::max(n, 1) * sizeof(uint8_t*)), "cudaMalloc loan table");
+        device_allocs_.push_back(p);
+        if (n) check(cudaMemcpy(p, loan_ptr_h_[d].data(), (size_t) n * sizeof(uint8_t*), cudaMemcpyHostToDevice), "loan table");
+        loan_ptr_d_[d] = static_cast<const uint8_t**>(p);
+        total += n;
+    }
+    loan_apply_n_.assign((size_t) n_layers, 0); loan_apply_side_.assign((size_t) n_layers, 0);
+    for (int side = 0; side < 2; ++side) loan_apply_dev_[side].assign((size_t) n_layers, nullptr);
+    loan_batches_.assign((size_t) n_layers, {});
+    loan_streams_.assign(devices_.size(), nullptr); loan_busy_.assign(devices_.size(), {});
+    loan_ev_pool_.assign(devices_.size(), {});
+    for (size_t d = 0; d < devices_.size(); ++d) {
+        check(cudaSetDevice(devices_[d]), "cudaSetDevice");
+        cudaStream_t ls; check(cudaStreamCreateWithFlags(&ls, cudaStreamNonBlocking), "loan stream"); loan_streams_[d] = ls;
+        loan_busy_[d].assign(loan_holder_[d].size(), 0);
+    }
+    for (int side = 0; side < 2; ++side) loan_apply_h_[side].assign((size_t) n_layers, nullptr);
+    for (int il = 0; il < n_layers; ++il) {
+        const LayerExperts& E = layers_[(size_t) il];
+        if (E.device < 0) continue;
+        check(cudaSetDevice(E.device), "cudaSetDevice");
+        // the entries in mapped pinned memory: the apply kernel reads them from the host directly (a memcpy on the compute
+        // stream would queue behind the loan copies on the copy engine and stall the layer)
+        for (int side = 0; side < 2; ++side) {
+            void* hp = nullptr; check(cudaHostAlloc(&hp, kLoanApplyMax * 8, cudaHostAllocPortable | cudaHostAllocMapped), "cudaHostAlloc loan apply");
+            loan_apply_h_[side][(size_t) il] = static_cast<int32_t*>(hp);
+            void* dp = nullptr; check(cudaHostGetDevicePointer(&dp, hp, 0), "loan apply device pointer");
+            loan_apply_dev_[side][(size_t) il] = static_cast<int32_t*>(dp);
+        }
+    }
+    std::fprintf(stderr, "glm5 experts: loan pool: %d slots of %.2f MB on the prefetch ring (decode windows cache their misses there; at most %d per window, %s)\n",
+                 total, loan_stride_ / 1e6, loan_per_win_, loan_h2d_ ? "CPU-served misses copied too" : "PCIe-staged misses only");
+}
+
+int ExpertStore::loan_alloc(size_t di, int il, int e, uint32_t tok) {
+    int j = -1;
+    if (!loan_free_[di].empty()) { j = loan_free_[di].back(); loan_free_[di].pop_back(); }
+    else {
+        // the LRU victim: the clock hand walks the pool; a slot used in this window (any layer) is skipped
+        const int n = (int) loan_holder_[di].size();
+        if (n == 0) return -1;
+        int best = -1; uint32_t oldest = tok;
+        for (int k = 0; k < n; ++k) {
+            const int cand = (loan_clock_[di] + k) % n;
+            if (loan_busy_[di][(size_t) cand]) continue;   // a copy in flight
+            // only a slot of a layer already served in this window (its grouping is known not to read the slot: last used
+            // before this window); a later layer's grouping of this window has not been published yet
+            if (loan_holder_[di][(size_t) cand].first > il) continue;
+            if (loan_last_used_[di][(size_t) cand] < oldest) { oldest = loan_last_used_[di][(size_t) cand]; best = cand; if (oldest + 8 < tok) break; }
+        }
+        if (best < 0) return -1;
+        loan_clock_[di] = (best + 1) % n;
+        const auto [hl, he] = loan_holder_[di][(size_t) best];
+        if (hl >= 0) {
+            if (loan_apply_n_[(size_t) hl] >= kLoanApplyMax - 1) return -1;   // its layer's update list is full: no eviction now
+            layers_[(size_t) hl].loan_of[(size_t) he] = -1;
+            layers_[(size_t) hl].loan_live[(size_t) he] = 0;   // (its device entry is cleared at its next grouping, before any use)
+            loan_push(hl, he, -1);
+        }
+        j = best;
+    }
+    loan_holder_[di][(size_t) j] = {il, e};
+    loan_last_used_[di][(size_t) j] = tok;
+    loan_busy_[di][(size_t) j] = 1;
+    layers_[(size_t) il].loan_of[(size_t) e] = j;
+    return j;
+}
+
+void ExpertStore::loan_push(int il, int e, int j) {
+    // (called under loan_m_) the immediate list: evictions (j < 0) and landed additions
+    int& n = loan_apply_n_[(size_t) il];
+    if (n >= kLoanApplyMax) return;
+    int32_t* buf = loan_apply_h_[loan_apply_side_[(size_t) il]][(size_t) il];
+    buf[2 * n] = e; buf[2 * n + 1] = j;
+    ++n;
+}
+
+void* ExpertStore::loan_event(size_t di) {
+    std::vector<void*>& pool = loan_ev_pool_[di];
+    if (!pool.empty()) { void* e = pool.back(); pool.pop_back(); return e; }
+    int cur = 0; cudaGetDevice(&cur);
+    if (cur != devices_[di]) check(cudaSetDevice(devices_[di]), "cudaSetDevice");
+    cudaEvent_t ev; check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "loan event create");
+    if (cur != devices_[di]) check(cudaSetDevice(cur), "cudaSetDevice");
+    return ev;
+}
+void ExpertStore::loan_event_done(size_t di, void* ev) { loan_ev_pool_[di].push_back(ev); }
+
+void ExpertStore::apply_loans(int il, void* stream) {
+    if (!loan_on_) return;
+    int n; int32_t* src_dev;
+    {
+        std::lock_guard<std::mutex> lk(loan_m_);
+        // the batches whose copies have landed (in order), their slots no longer busy
+        std::deque<LoanBatch>& q = loan_batches_[(size_t) il];
+        const size_t di = (size_t) device_index_of_layer(il);
+        while (!q.empty() && cudaEventQuery(static_cast<cudaEvent_t>(q.front().ev)) == cudaSuccess) {
+            LoanBatch& b = q.front();
+            for (const auto& [e, j] : b.adds) {
+                if (layers_[(size_t) il].loan_of[(size_t) e] == j) { loan_push(il, e, j); layers_[(size_t) il].loan_live[(size_t) e] = 1; }   // live from this grouping on
+                loan_busy_[di][(size_t) j] = 0;
+            }
+            loan_event_done(b.di, b.ev);
+            q.pop_front();
+        }
+        n = loan_apply_n_[(size_t) il];
+        if (n == 0) return;
+        src_dev = loan_apply_dev_[loan_apply_side_[(size_t) il]][(size_t) il];
+        loan_apply_side_[(size_t) il] ^= 1;      // the host fills the other buffer from now on
+        loan_apply_n_[(size_t) il] = 0;
+    }
+    strata::glm5::loan_apply(src_dev, n, layers_[(size_t) il].slot_of_dev, stream);   // reads the mapped entries
+}
+
+void ExpertStore::reset_loans() {
+    if (!loan_on_) return;
+    std::lock_guard<std::mutex> lk(loan_m_);
+    bool any_loan = false;
+    for (size_t d = 0; d < devices_.size() && !any_loan; ++d) any_loan = loan_free_[d].size() != loan_holder_[d].size();
+    for (size_t il = 0; il < layers_.size() && !any_loan; ++il) any_loan = loan_apply_n_[il] != 0 || !loan_batches_[il].empty();
+    if (!any_loan) return;
+    for (size_t d = 0; d < devices_.size(); ++d) {
+        check(cudaSetDevice(devices_[d]), "cudaSetDevice");
+        check(cudaStreamSynchronize(static_cast<cudaStream_t>(copy_streams_[d])), "loan reset sync");
+        check(cudaStreamSynchronize(static_cast<cudaStream_t>(loan_streams_[d])), "loan reset sync");
+        const int n = (int) loan_holder_[d].size();
+        loan_holder_[d].assign((size_t) n, {-1, -1}); loan_last_used_[d].assign((size_t) n, 0u); loan_busy_[d].assign((size_t) n, 0);
+        loan_free_[d].clear();
+        for (int j = n - 1; j >= 0; --j) loan_free_[d].push_back(j);
+        loan_clock_[d] = 0;
+    }
+    for (size_t il = 0; il < layers_.size(); ++il) {
+        LayerExperts& E = layers_[il];
+        if (E.device < 0 || E.loan_of.empty()) continue;
+        bool any = false;
+        for (auto& v : E.loan_of) if (v >= 0) { v = -1; any = true; }
+        for (auto& v : E.loan_live) v = 0;
+        loan_apply_n_[il] = 0;
+        for (auto& b : loan_batches_[il]) loan_event_done(b.di, b.ev);
+        loan_batches_[il].clear();
+        if (any) {   // the device table back to the resident slots (the host mirror of slot_of is current)
+            check(cudaSetDevice(E.device), "cudaSetDevice");
+            check(cudaMemcpy(E.slot_of_dev, E.slot_of.data(), E.slot_of.size() * 4, cudaMemcpyHostToDevice), "loan reset table");
+        }
+    }
 }
 
 int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float* x_rows, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, uint32_t* h_flag2,
                            uint32_t* flag2_dev, float* y_dev, int n_embd, int* miss_cpu, int* miss_slot, int* miss_out, int max_swaps) {
     LayerExperts& E = layers_[(size_t) il];
+    if (route_log_) { std::fprintf(route_log_, "T %u %d", tok, il); for (int j2 = 0; j2 < n; ++j2) std::fprintf(route_log_, " %d", ids[j2]); std::fprintf(route_log_, "\n"); }
     const strata::kernels::cpu::NativeFmt& f = fmt_[(size_t) il];
     const size_t di = (size_t) device_index_of_layer(il);
     cudaStream_t cs = static_cast<cudaStream_t>(copy_streams_[di]);
@@ -724,13 +915,22 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     // k_moe_group's pair layout: counts per expert; the hits' groups first (ascending id), then the misses' (ascending);
     // inside a group the pairs in token order
     std::vector<int> count((size_t) ne, 0);
-    for (int j = 0; j < n; ++j) { const int e = ids[j]; ++counts_[(size_t) il][(size_t) e]; ++count[(size_t) e]; if (E.slot_of[(size_t) e] >= 0) ++hits_; else ++misses_; }
+    auto resident = [&](int e) { return E.slot_of[(size_t) e] >= 0 || (loan_on_ && E.loan_live[(size_t) e]); };   // live = in the device's table too
+    for (int j = 0; j < n; ++j) {
+        const int e = ids[j];
+        if (e < 0 || e >= ne) {   // a routing id outside the experts: the router saw NaN / garbage activations
+            std::fprintf(stderr, "glm5 experts: layer %d window %u: routing id %d of %d (pair %d of %d) is out of range: the activations are corrupt\n", il, tok, e, ne, j, n);
+            throw std::runtime_error("glm5 experts: a routing id out of range (corrupt activations)");
+        }
+        ++counts_[(size_t) il][(size_t) e]; ++count[(size_t) e];
+        if (resident(e)) { ++hits_; if (E.slot_of[(size_t) e] < 0) { ++loan_hits_; loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok; } } else ++misses_;
+    }
     int col = 0;
-    for (int e = 0; e < ne; ++e) if (count[(size_t) e] && E.slot_of[(size_t) e] >= 0) col += count[(size_t) e];
+    for (int e = 0; e < ne; ++e) if (count[(size_t) e] && resident(e)) col += count[(size_t) e];
     const int first_miss_row = col;
     std::vector<int> miss_e;
     std::vector<int> col0((size_t) ne, -1);
-    for (int e = 0; e < ne; ++e) if (count[(size_t) e] && E.slot_of[(size_t) e] < 0) { col0[(size_t) e] = col; col += count[(size_t) e]; miss_e.push_back(e); }
+    for (int e = 0; e < ne; ++e) if (count[(size_t) e] && !resident(e)) { col0[(size_t) e] = col; col += count[(size_t) e]; miss_e.push_back(e); }
     const int n_pairs = col, n_miss_rows = col - first_miss_row;
     distinct_misses_ += miss_e.size();
     if (!miss_e.empty()) ++layers_missed_;
@@ -792,6 +992,42 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     swaps_ += (uint64_t) swapped;
     // the DMA'd misses' flag, queued behind their copies: the device computes them while the CPU works
     if (n_dma > 0) { if (flag_dev) flag_kernel(E.device, flag_dev, tok, cs); } else __atomic_store_n(h_flag, tok, __ATOMIC_RELEASE);
+    // the loans: a missed expert with a pinned host copy is also copied into a loan slot (CPU-served: from the host; PCIe
+    // staged: a device-to-device copy from its staging slot), usable from this layer's next window
+    if (loan_on_ && E.stride <= loan_stride_) {
+        cudaStream_t ls = static_cast<cudaStream_t>(loan_streams_[di]);
+        LoanBatch batch{nullptr, di, {}};
+        bool staged_any = false;
+        for (size_t i = 0; i < miss_e.size() && (int) batch.adds.size() < loan_per_win_; ++i) {
+            const int e = miss_e[i];
+            const bool staged = !on_cpu[i] && miss_slot[i] < 0 && staged_at[i] < 0;
+            if (!on_cpu[i] && !staged) continue;                    // swapped into a resident slot: resident already
+            if (on_cpu[i] && (!loan_h2d_ || !E.host_pinned[(size_t) e] || E.host_gate[(size_t) e] == nullptr)) continue;
+            int j;
+            { std::lock_guard<std::mutex> lk(loan_m_); j = loan_alloc(di, il, e, tok); }
+            if (j < 0) break;
+            uint8_t* dst = loan_ptr_h_[di][(size_t) j];
+            if (on_cpu[i]) check(cudaMemcpyAsync(dst, E.host_gate[(size_t) e], E.blob, cudaMemcpyHostToDevice, ls), "loan h2d");
+            else {
+                if (!staged_any) {   // the staging copies are on the copy stream: order the loan stream behind them once
+                    std::lock_guard<std::mutex> lk(loan_m_);
+                    cudaEvent_t se = static_cast<cudaEvent_t>(loan_event(di));
+                    check(cudaEventRecord(se, cs), "loan stage event"); check(cudaStreamWaitEvent(ls, se, 0), "loan stage wait");
+                    loan_event_done(di, se); staged_any = true;
+                }
+                check(cudaMemcpyAsync(dst, stage_[di] + i * stage_slot_bytes_[di], E.blob, cudaMemcpyDeviceToDevice, ls), "loan d2d");
+            }
+            copy_bytes_ += E.blob;
+            batch.adds.emplace_back(e, j);
+        }
+        if (!batch.adds.empty()) {
+            std::lock_guard<std::mutex> lk(loan_m_);
+            batch.ev = loan_event(di);
+            check(cudaEventRecord(static_cast<cudaEvent_t>(batch.ev), ls), "loan batch event");
+            loans_made_ += batch.adds.size();
+            loan_batches_[(size_t) il].push_back(std::move(batch));
+        }
+    }
     lap(0, tl);
     // the tokens' inputs quantized for the gate/up dot products
     for (int t = 0; t < T; ++t) strata::kernels::cpu::native_quant_act(f, x_rows + (size_t) t * n_embd, act_[(size_t) t].data());
@@ -861,6 +1097,15 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     pool_.run(std::move(jobs));
     lap(4, tl);
     // the CPU-served pairs' rows to the device (per expert: a contiguous run of rows), then the flag
+    if (y_pin_dev_ && !misses.empty()) {
+        // one kernel reads the whole layer's rows from the mapped pinned block (a kernel launch needs the device current)
+        int cur = 0; cudaGetDevice(&cur);
+        if (cur != E.device) check(cudaSetDevice(E.device), "cudaSetDevice");
+        for (const Miss& ms : misses)
+            strata::glm5::copy_host_rows(y_pin_dev_ + (size_t) (il * 64) * n_embd + (size_t) (ms.row0 - first_miss_row) * n_embd, y_dev + (size_t) ms.row0 * n_embd,
+                                         ms.toks.size() * (size_t) n_embd, cs);
+        if (cur != E.device) check(cudaSetDevice(cur), "cudaSetDevice");
+    } else
     for (const Miss& ms : misses)
         check(cudaMemcpyAsync(y_dev + (size_t) ms.row0 * n_embd, y_layer + (size_t) (ms.row0 - first_miss_row) * n_embd, ms.toks.size() * (size_t) n_embd * 4,
                               cudaMemcpyHostToDevice, cs), "cpu y h2d");

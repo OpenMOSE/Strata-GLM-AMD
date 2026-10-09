@@ -168,6 +168,18 @@ def main(a) -> int:
     models_dir = Path(a.models_dir) if a.models_dir else data / "models"
     if a.check:
         return 0
+    if a.update and cfg_path.is_file() and is_glm_config(cfg_path):
+        # update.sh: the engine rebuilt for the cards of the existing config, nothing asked, nothing started
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        byid = {g["index"]: g for g in usable}
+        cards = [byid[i] for i in (cfg.get("gpu") or [0]) if i in byid] or usable[:1]
+        S.step(2, "Python packages and build tools")
+        S.pip_install(S.requirement_lines(), "Python packages")
+        llama = S.get_llama_cpp()
+        S.step(3, "the engine")
+        build_engine(cards, llama)
+        S.ok("updated (nothing started): ./setup.sh starts the model")
+        return 0
 
     # ---- 2. the choices
     S.step(2, "choices")

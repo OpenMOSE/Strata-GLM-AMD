@@ -159,6 +159,7 @@ public:
     /// logits() and h_win() are the last window's.  Falls back to serial windows when the pipeline cannot run.
     void prompt_windows(int slot, const int32_t* tokens, int n, int wsize, const std::function<void(int, int, bool)>& on_window);
     bool pipeline_ready() const;
+    void drop_loans();   ///< before a prompt window: the decode loans in the prompt ring are dropped (the devices synced first)
     int solo_slot() const { return n_slots_; }
     ~Engine();
     Engine(const Engine&) = delete;
@@ -319,6 +320,11 @@ public:
         int8_t* q2k_codes = nullptr;      ///< the Q2_K WMMA path: int8 activations of the pairs [pairs_alloc][E], then of the swiglu rows [..][FF]
         float* q2k_scales = nullptr;      ///< [pairs_alloc][E/256]
         int32_t* q2k_sums = nullptr;      ///< [pairs_alloc][E/16]
+        int32_t* q2k_packed = nullptr;    ///< the decode WMMA path: the pair sums packed per super-block [64][E/256][8]
+        int8_t* dec_codes_h = nullptr;    ///< the decode path's swiglu rows: int8 [64][FF], scales [64][FF/256], sums [64][FF/16], packed [64][FF/256][8]
+        float* dec_scales_h = nullptr;
+        int32_t* dec_sums_h = nullptr;
+        int32_t* dec_packed_h = nullptr;
         // the prompt windows' expert buffers alternate per MoE layer (the store's staging and its twin): buf_ev[k] is
         // recorded after the last reader of buffer k, the next prefetch into it waits for that event
         std::vector<void*> layer_ev;      ///< per layer x 2 (the window's parity): the event after its MoE's last read of its ring buffer

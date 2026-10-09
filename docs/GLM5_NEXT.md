@@ -885,3 +885,96 @@ judged by whether the next `<arg_key>` or `</tool_call>` follows at that positio
 | strata-glm53-1gpu.json | 0 | 262144 | 1 | 17.9 (+ --pin-gib 96) | decode 15 tok/s, prefill 490 tok/s |
 
 On 1 GPU, unless the entire non-resident portion (82 GiB) is pinned, the prompt's prefetch stalls for lack of staging slots (`--pin-gib` default 64).
+
+## Decode: the Q2_K products on WMMA (2026-10-09)
+
+The decode round (window of 3 rows, spec 2, ~80 ms) measured per phase: resident expert products ~30 ms (5.5 GB read at
+~180 GB/s), dense layers ~25 ms, the wait for the CPU's misses 6-12 ms, the rest ~10 ms. A micro-benchmark of one layer
+(20 experts x 1-3 columns, scratchpad `dec_bench`): the grouped MMVQ 161 / 114 GB/s (gate / down), the prompt WMMA
+kernel 268 / 252, a D2D copy 680. Q2_K is instruction-bound, not memory-bound: the plain Q2_K MMVQ stays at 233 GB/s
+even from the Infinity Cache, while Q4_K reaches 500. A dp4a kernel with integer accumulation per 32-weight block was
+tried first and ran at 100 GB/s for 3 columns (6 VALU/LDS instructions per weight byte: the arithmetic alone takes that long).
+
+The int8 WMMA packs 16 columns of dot products into one instruction, so the decode kernel is a WMMA variant (`dec_wmma`
+in moe_q2k.cu): one 16-column tile per group (a decode window has at most 8 pairs on an expert), the activation sums
+pre-packed per (column, super-block) by `pack_sums` (the prompt kernel repacks them per lane and super-block), the grouped
+tables (`grp_w`, `col0`, `ncols`, `orow`) as its interface. 550-565 GB/s on the benchmark, bit-identical to the prompt
+kernel on the same operands. In the engine the pairs' activations are quantized per 256 (`quantize_act`) as the prompt
+path does, so decode and prompt now share one quantization; `STRATA_GLM5_NODECQ2K=1` restores the grouped MMVQ.
+
+| | old | new |
+|---|---|---|
+| 1064 + 96 tokens, spec 2 | 28.6 tok/s (86 ms/round) | 30.8 tok/s (82 ms/round) |
+| spec 3 | - | 30.8 tok/s (3.00 tokens/round) |
+| slots-test, solo no drafts | 88.5 ms/token | 76.5 ms/token |
+| slots-test, 2 slots no drafts | 67.3 ms/window | 57.4 ms/window |
+| 1064 + 24 greedy | reference | 23/24 identical (the quantization change) |
+
+Why the engine gains only 8% where the kernel gains 3x: the CPU's miss computation (~180 distinct experts per round,
+1.5 GB from pinned RAM at ~34 GB/s = 44 ms) ran concurrently with the resident products and already hid them. With
+the products at 8 ms the wait for the CPU is exposed (moe_wait 12 -> 23 ms). The round is now ~45 ms of GPU-only
+work (dense layers, router, MTP) serialized layer by layer with ~44 ms of CPU work; the memory bus is the floor of
+the CPU part. The remaining single-stream levers are the dense phase (25 ms for 9.8 GiB of weights, ~400 GB/s) and
+the per-layer overheads; the structural lever is interleaving two requests at layer granularity so one request's CPU
+phase overlaps the other's GPU phase (expected ~1.6x aggregate at np=2).
+
+## Decode: the loan pool (2026-10-09)
+
+**The measurement first.** With fresh prompts (8 of them: Japanese and English explanations, Python / TypeScript / Rust
+tasks, thinking on) the static profile hits only 67% and decode runs at 28-30 tok/s with speculation (18 tok/s on the
+`--prompts` path, which decodes without the draft model). A routing log (`STRATA_GLM5_ROUTE_LOG=<path>`: the resident
+sets and every decode window's ids) replayed through residency policies (scratchpad `route_sim.py`):
+
+| policy on the same routing | hit | distinct misses per window |
+|---|---|---|
+| the static profile | 66.9% | 2.65 |
+| the best static set for this stream | 82.9% | |
+| LRU, every miss swapped in (unlimited bandwidth) | 90.6% | 0.75 |
+| EMA migration, 1-4 experts per layer per window | 90.0-90.7% | 0.74-0.80 |
+| static + a loan pool of 10 / 20 / 30 slots per layer, LRU | 84.5 / 89.1 / 92.0% | 1.24 / 0.87 / 0.64 |
+
+The working set moves with the request: no fixed set does better than 83%, a time-adaptive one passes 90%.
+
+**The loan pool.** During decode the prompt windows' prefetch ring (2 x 1.34 + 2 x 1.20 GiB = 660 slots of 8.26 MB on
+the two cards) is lent to the expert store as an LRU cache of missed experts: a slot table entry `kLoanBit | j`
+addresses `loan_ptr[j]` (the grouping kernel's second address space), the store keeps `loan_of` per expert beside
+`slot_of`, and the table updates go through per-layer lists applied by `k_loan_apply` before the layer's grouping.
+A prompt window takes the ring back: `drop_loans()` syncs the devices and clears the tables. Protections: a slot used
+in the current window is never a victim, a slot whose copy is in flight is not either, and an eviction's table entry
+is applied before any addition. `STRATA_GLM5_LOAN=0` disables, `STRATA_GLM5_LOAN_PER_WIN` caps the loans per call.
+
+**What did not work, and why.** Copying the CPU-served misses from the host into loan slots (`STRATA_GLM5_LOAN_H2D=1`)
+raised the hit rate to 85% but made decode slower, in three steps of diagnosis: (1) the copies on the serve path's copy
+stream delayed each layer's flag (fixed: a loan stream per device); (2) the table update was a small host-to-device
+memcpy on the compute stream, which queued behind the 8 MB loan copies on the copy engine and stalled every layer
+(moe_wait 11 -> 42-78 ms; fixed: the apply kernel reads mapped pinned entries, and the CPU's result rows are copied by
+a kernel too); (3) what remained is the memory bus: a CPU-served miss already reads its 8.3 MB blob once, and the loan
+copy reads it again, so in steady state the copies cost about what the extra hits save (the same prompt: 25.6 vs 28.5
+tok/s). The default therefore loans only the misses the CPU/PCIe split sends over PCIe: their blob crosses the bus
+once (into staging), and the loan is a device-to-device copy. Biasing the split toward PCIe (`STRATA_GLM5_DMA_MS`)
+lengthens the PCIe side and loses again (31.9-32.4 vs 33.6).
+
+| prompt (300 tokens, spec 2) | loans off | loans (PCIe-staged) | hit off -> on |
+|---|---|---|---|
+| Python CLI tool (3) | 28.5 | **33.6** | |
+| Japanese seasons (1) | 36.1 | **39.2** | 86.6 -> 89.3% |
+| TypeScript (5) | 30.2 | **36.0** | 74.3 -> 79.2% |
+| Rust (8) | 31.9 | **34.0** | 73.6 -> 78.8% |
+
+1064 + 24 greedy: 24/24 identical to the reference; `--slots-test 2`: 0 mismatches.
+
+**Where decode stands.** A round (3 rows) is ~45 ms of GPU-only work (dense layers 25, router, MTP) serialized layer by
+layer with the CPU's misses at ~0.2 ms each (8.3 MB from pinned RAM at the bus's 42 GB/s). The remaining levers:
+more loan capacity (the prompt scratch, ~4 GiB per card more), a smaller GPU base, and for two requests the layer
+interleave. Short prompts (T < 256, the mid-size window path) wait on the ring's PCIe copies (a 39-token prompt takes
+1.1 s): the CPU split applies there too.
+
+**The crash it caused (fixed, e97a32a).** The server's engine died after ~1,800 tokens of a long answer: a segfault in
+serve_cpu's routing loop (the kernel log's address symbolized to it, and gdb reproduced it at window 803), i.e. a
+routing id outside 0..287: the activations had turned to garbage. Two consistency holes between the host's and the
+device's view of the loans: (1) the host counted a loan as resident from its allocation, the device only from the
+table update at the layer's next grouping, so a hit on one side was a miss on the other and the pair rows were laid
+out differently; (2) the LRU could evict a slot of a later layer of the same window, whose grouping (not yet published)
+would still read it while the new copy overwrote it. Now a loan is `loan_live` only once applied, victims come only
+from layers already served in the window, and an id out of range stops with a message. 2 x 2,500 tokens, the
+exactness test and the eight-prompt alternation pass.

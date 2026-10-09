@@ -10,7 +10,9 @@
 #include "strata/glm5/glm5.hpp"
 
 #include <condition_variable>
+#include <deque>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -52,6 +54,8 @@ struct LayerExperts {
     std::vector<uint8_t> host_pinned;         ///< per expert: host_gate points at a contiguous pinned blob (DMA-able as one)
     std::vector<uint8_t> evicted_once;        ///< per expert: was resident and got swapped out at some point (a re-miss = thrash)
     std::vector<uint32_t> last_miss_tok;      ///< per expert: 1 + the window of its last miss (0: never missed)
+    std::vector<int32_t> loan_of;             ///< per expert: its loan slot on the device's loan pool, or -1 (the decode path's cache)
+    std::vector<char> loan_live;              ///< per expert: the loan is in the device's slot table (a hit for both sides); set and cleared with the table
     int fd = -1;                              ///< the shard holding this layer's experts (pread for cold blobs)
     uint64_t off_gate = 0, off_up = 0, off_down = 0;   ///< file offsets of expert 0's rows
 };
@@ -136,6 +140,16 @@ public:
     uint64_t hits() const { return hits_; }
     uint64_t misses() const { return misses_; }
     uint64_t host_pinned_bytes() const { return pinned_bytes_ + pool_bytes_; }
+    /// The loan pool (decode windows): the prompt windows' prefetch ring lent as an LRU cache of missed experts.  A miss the
+    /// CPU computes (or PCIe staged) is also copied into a loan slot; from the next window on the device reads it there
+    /// (the slot table entry kLoanBit | j, applied by apply_loans before the layer's grouping).  Reset before a prompt
+    /// window (the ring is the prompt path's).  STRATA_GLM5_LOAN=0 disables, STRATA_GLM5_LOAN_PER_WIN caps the loans per call.
+    bool loans_on() const { return loan_on_; }
+    const uint8_t* const* loan_ptrs(int device_index) const { return loan_ptr_d_.empty() ? nullptr : loan_ptr_d_[(size_t) device_index]; }
+    void apply_loans(int il, void* stream);        ///< the pending slot table updates of layer il (on the layer's device, before its grouping)
+    void reset_loans();                            ///< every loan dropped (the host syncs the devices first)
+    uint64_t loan_hits() const { return loan_hits_; }
+    uint64_t loans_made() const { return loans_made_; }
 
 private:
     void plan(const Model& m, const ExpertStoreConfig& cfg);
@@ -196,6 +210,36 @@ private:
     double cpu_t_[6] = {0, 0, 0, 0, 0, 0};   ///< split, quant x, phase A, quant h, phase B, enqueue
     uint64_t cpu_calls_ = 0;
     int cpu_threads_ = 8;
+    // the loan pool, per device: slot j = loan_ptr_h_[di][j] (loan_stride_ bytes), its holder (layer, expert) and last window
+    bool loan_on_ = false;
+    uint64_t loan_stride_ = 0;
+    int loan_per_win_ = 8;
+    bool loan_h2d_ = false;
+    std::vector<std::vector<uint8_t*>> loan_ptr_h_;
+    std::vector<const uint8_t**> loan_ptr_d_;
+    std::vector<std::vector<std::pair<int, int>>> loan_holder_;   ///< per device, per slot: (layer, expert) or (-1, -1)
+    std::vector<std::vector<uint32_t>> loan_last_used_;
+    std::vector<std::vector<int>> loan_free_;
+    std::vector<int> loan_clock_;                                  ///< per device: the LRU scan position
+    // per layer: the pending table updates (e, j) in two pinned buffers (the device copies one while the host fills the other)
+    std::vector<int32_t*> loan_apply_h_[2];
+    std::vector<int32_t*> loan_apply_dev_[2];                       ///< the device views of the two mapped buffers
+    std::vector<int> loan_apply_n_;
+    std::vector<int> loan_apply_side_;
+    std::vector<void*> loan_streams_;                              ///< per device: the loan copies' own stream (never ahead of a layer's flags)
+    std::vector<std::vector<char>> loan_busy_;                     ///< per device, per slot: a copy in flight (not a victim until applied)
+    struct LoanBatch { void* ev; size_t di; std::vector<std::pair<int, int>> adds; };   ///< the additions of one serve call and the event after their copies
+    std::vector<std::deque<LoanBatch>> loan_batches_;              ///< per layer: in copy order
+    std::vector<std::vector<void*>> loan_ev_pool_;                 ///< per device (events are device-bound)
+    std::mutex loan_m_;
+    uint64_t loan_hits_ = 0, loans_made_ = 0;
+    static constexpr int kLoanApplyMax = 256;
+    void init_loans(int n_layers);
+    int loan_alloc(size_t di, int il, int e, uint32_t tok);        ///< a free or LRU loan slot (not one used in window tok), or -1
+    void loan_push(int il, int e, int j);                           ///< queue the table update (under loan_m_)
+    void* loan_event(size_t di);                                   ///< a pooled event of that device
+    void loan_event_done(size_t di, void* ev);
+    FILE* route_log_ = nullptr;   ///< STRATA_GLM5_ROUTE_LOG=<path>: the decode routing per window (T tok layer ids...) and the resident sets (S layer ids...)
     double cpu_pair_ms_ = 0.9;    ///< the CPU's cost of one missed pair (ms of all threads together); tuned by measurement
     double dma_ms_ = 0.65;         ///< one expert blob over PCIe
     double gpu_before_dma_ms_ = 0.4, gpu_before_cpu_ms_ = 1.0;   ///< the device's own work before each wait (the overlap budgets)
@@ -206,6 +250,7 @@ private:
     std::vector<std::vector<float>> ff_;                 ///< per pair: swiglu output (n_ff)
     std::vector<std::vector<uint8_t>> hq_;               ///< per pair: quantized swiglu output
     float* y_pin_ = nullptr;                             ///< pinned [n_layers][64][n_embd]: the pairs' outputs, DMA source
+    float* y_pin_dev_ = nullptr;                         ///< its device pointer (mapped): the rows are read by a kernel, not the copy engine
     int y_pin_rows_ = 0;
     std::vector<uint8_t> seen_;   ///< scratch of serve(): distinct misses
     double file_ms_ = 0;

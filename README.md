@@ -27,8 +27,12 @@ on the CPU, a guess-and-check draft model) plus work specific to this model:
   236K.
 - **All caches as Q8_0.** The latent KV, indexer key and gate caches are 8-bit rows: one slot's 256K context is
   about 1.2 GiB per card instead of f32's 5 GiB, and the prompt attention reads them as its int8 operand directly.
-- **Q2_K experts on the tensor cores.** A WMMA kernel for the 2-bit expert weights (RDNA 3 int8 WMMA, 22-28 TMAC/s
-  against the generic 10-12) - the quantization stays as downloaded.
+- **Q2_K experts on the tensor cores.** WMMA kernels for the 2-bit expert weights, for prompts (22-28 TMAC/s against
+  the generic 10-12) and for decoding (550 GB/s against 115-160) - the quantization stays as downloaded.
+- **A decode-time expert cache.** The experts the cards do not hold are computed on the CPU from pinned RAM, which is
+  the memory bus's floor; while decoding, the prompt buffers are lent out as a cache of the experts that came over
+  PCIe, so fresh conversations route to VRAM more often (+7-19% on new prompts). The shipped routing profile
+  (`data/glm53/expert-profile.txt`) seeds the static ranking and keeps accumulating on your traffic.
 - **A two-card prompt pipeline.** The layers are split across the cards; while card 1 finishes window k, card 0
   already runs window k+1. 128K prompts: 592 -> 1,060 tokens/s, outputs identical.
 - **Tool calls and thinking** in GLM-5's own chat-template format (`<tool_call>name<arg_key>...`), thinking
@@ -41,7 +45,7 @@ only), 125 GB RAM, Linux, ROCm 7. The model is the 3-bit GSQ-RCO GGUF (117 GB) w
 
 | | 2 cards | 1 card |
 | --- | ---: | ---: |
-| **Writes answers** (one chat, with the draft model) | 30-34 tokens/s | 15-16 tokens/s |
+| **Writes answers** (one chat, with the draft model) | 30-39 tokens/s | 15-16 tokens/s |
 | **Two chats at once** (`"parallel": 2`, aggregate) | ~30 tokens/s | - |
 | **Reads a 4K prompt** | 750 tokens/s | - |
 | **Reads a 12K prompt** | 1,000-1,100 tokens/s | 490 tokens/s |
@@ -77,7 +81,7 @@ the two model files (122 GB), compiles the engine (10-20 minutes, once), extract
 config with the expert budgets sized for your cards, and starts the model. Press Enter for the recommended
 answers, or pass them: `--gpus 0,1 --context 262144 --parallel 1 --yes`. Model files you already have:
 `--gguf-dir <folder>`. Later, `./setup.sh` alone starts the model (or `run-glm53.sh`); `./setup.sh --family glm53`
-again changes the settings; `./update.sh` rebuilds the engine after a `git pull`.
+again changes the settings. After a `git pull` run `./update.sh`: a plain start does not rebuild the engine.
 
 ### By hand
 

@@ -366,10 +366,10 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
             if ((int) ids.size() + max_new > ctx) max_new = ctx - (int) ids.size();
             if (max_new <= 0) { std::printf("ERR the prompt fills the context\n"); std::fflush(stdout); if (bgen) { std::printf("BADM %d 0\n", target); std::fflush(stdout); } continue; }
             SpecStats st;
-            struct Snap { uint64_t hits, misses, swaps, distinct, thrash, bytes; double ms; uint64_t freads, fbytes; double fms; double cms; uint64_t cpairs; };
+            struct Snap { uint64_t hits, misses, swaps, distinct, thrash, bytes; double ms; uint64_t freads, fbytes; double fms; double cms; uint64_t cpairs; uint64_t lhits, lmade; };
             auto snap = [&]() {
                 Snap x{};
-                if (store) x = {store->hits(), store->misses(), store->swaps(), store->distinct_misses(), store->thrash(), store->copy_bytes(), store->copy_ms(), store->file_reads(), store->file_bytes(), store->file_ms(), store->cpu_ms(), store->cpu_pairs()};
+                if (store) x = {store->hits(), store->misses(), store->swaps(), store->distinct_misses(), store->thrash(), store->copy_bytes(), store->copy_ms(), store->file_reads(), store->file_bytes(), store->file_ms(), store->cpu_ms(), store->cpu_pairs(), store->loan_hits(), store->loans_made()};
                 return x;
             };
             const Snap s0 = snap();
@@ -448,13 +448,14 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
             }
             const Snap s1 = snap();
             std::fprintf(stderr, "glm5: %zu prompt (%zu reused) %.0f ms, %zu tokens %.0f ms = %.1f tok/s, %s; spec %d/%d in %d rounds (%.0f ms/round, mtp %.0f ms);"
-                         " experts: %.1f%% hit, %llu misses, %llu swaps (%llu distinct, %llu thrash), %.0f MB in %.0f ms, file reads %llu (%.0f MB, %.0f ms), cpu %llu pairs in %.0f ms\n", ids.size(), p, prompt_ms,
+                         " experts: %.1f%% hit, %llu misses, %llu swaps (%llu distinct, %llu thrash), %.0f MB in %.0f ms, file reads %llu (%.0f MB, %.0f ms), cpu %llu pairs in %.0f ms; loans %llu hits, %llu made\n", ids.size(), p, prompt_ms,
                          out.size(), decode_ms, out.empty() ? 0.0 : out.size() / (decode_ms / 1e3), finish.c_str(), st.accepted, st.drafted, st.rounds,
                          st.rounds ? decode_ms / st.rounds : 0.0, st.mtp_s * 1e3,
                          (s1.hits + s1.misses > s0.hits + s0.misses) ? 100.0 * (double) (s1.hits - s0.hits) / (double) ((s1.hits + s1.misses) - (s0.hits + s0.misses)) : 0.0,
                          (unsigned long long) (s1.misses - s0.misses), (unsigned long long) (s1.swaps - s0.swaps), (unsigned long long) (s1.distinct - s0.distinct),
                          (unsigned long long) (s1.thrash - s0.thrash), (double) (s1.bytes - s0.bytes) / 1e6, s1.ms - s0.ms,
-                         (unsigned long long) (s1.freads - s0.freads), (double) (s1.fbytes - s0.fbytes) / 1e6, s1.fms - s0.fms, (unsigned long long) (s1.cpairs - s0.cpairs), s1.cms - s0.cms);
+                         (unsigned long long) (s1.freads - s0.freads), (double) (s1.fbytes - s0.fbytes) / 1e6, s1.fms - s0.fms, (unsigned long long) (s1.cpairs - s0.cpairs), s1.cms - s0.cms,
+                         (unsigned long long) (s1.lhits - s0.lhits), (unsigned long long) (s1.lmade - s0.lmade));
         } catch (const std::exception& e) {
             std::printf("ERR %s\n", e.what());
             std::fflush(stdout);

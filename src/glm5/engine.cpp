@@ -42,6 +42,7 @@ inline size_t q8_cols(int n) { return strata::kernels::native_q8_1_bytes(n, 1); 
 const bool kDebugSync = std::getenv("STRATA_GLM5_SYNC") != nullptr;   // synchronise after every layer and name a fault
 const bool kNoDoorbell = std::getenv("STRATA_GLM5_NODOORBELL") != nullptr;   // stage the misses synchronously instead
 const bool kTrace = std::getenv("STRATA_GLM5_TRACE") != nullptr;
+const bool kNoDecQ2K = std::getenv("STRATA_GLM5_NODECQ2K") && std::atoi(std::getenv("STRATA_GLM5_NODECQ2K")) != 0;   // the decode Q2_K products back on the grouped MMVQ
 const bool kProf = std::getenv("STRATA_GLM5_PROF") != nullptr;   // per-phase GPU times of every window
 constexpr int kDsaBatch = 64;    // tokens per DSA score / select / attend launch
 // prompt windows attend through MMQ over the whole latent cache (masked) up to this many cells (STRATA_GLM5_ATTN_MAXKV; the S
@@ -269,6 +270,12 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
                     d.q2k_codes = static_cast<int8_t*>(alloc((uint64_t) pairs_alloc_ * E, ordinal));
                     d.q2k_scales = f((uint64_t) pairs_alloc_ * (E / 256));
                     d.q2k_sums = static_cast<int32_t*>(alloc((uint64_t) pairs_alloc_ * (E / 16) * 4, ordinal));
+                    // the decode windows (at most 64 pairs) on the same kernel family: packed sums, and the swiglu rows' operands
+                    d.q2k_packed = static_cast<int32_t*>(alloc((uint64_t) 64 * (E / 256) * 8 * 4, ordinal));
+                    d.dec_codes_h = static_cast<int8_t*>(alloc((uint64_t) 64 * FF, ordinal));
+                    d.dec_scales_h = f((uint64_t) 64 * (FF / 256));
+                    d.dec_sums_h = static_cast<int32_t*>(alloc((uint64_t) 64 * (FF / 16) * 4, ordinal));
+                    d.dec_packed_h = static_cast<int32_t*>(alloc((uint64_t) 64 * (FF / 256) * 8 * 4, ordinal));
                 }
                 d.iota = static_cast<int32_t*>(alloc((uint64_t) pairs_alloc_ * 4, ordinal));
                 { std::vector<int32_t> h((size_t) pairs_alloc_); std::iota(h.begin(), h.end(), 0); check(cudaMemcpy(d.iota, h.data(), h.size() * 4, cudaMemcpyHostToDevice), "iota"); }
@@ -1277,12 +1284,22 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
         moe_mmq(d, il, T, xn, out, doorbell, slot_of, slots, blob, stage, stage_bytes, all_resident, dump, last_chunk);
         return;
     }
-    moe_group(d.ids, d.wts, T, K, hp_.n_expert, slot_of, slots, blob, L.exp_gate.stride, L.exp_up.stride, stage, stage_bytes, d.grp_w, d.grp_wu,
+    // the loan slots' table updates (misses the earlier windows cached in the prompt ring) before this grouping
+    if (experts_ && doorbell && !prompt_mode_ && il < hp_.n_layer) experts_->apply_loans(il, d.stream);
+    moe_group(d.ids, d.wts, T, K, hp_.n_expert, slot_of, slots, blob, L.exp_gate.stride, L.exp_up.stride, stage, stage_bytes,
+              experts_ ? experts_->loan_ptrs(experts_->device_index_of_layer(il)) : nullptr, d.grp_w, d.grp_wu,
               d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, d.pair_tok, d.pair_w, d.cnt, d.grp_e, d.grp_miss, true, nullptr, d.tok_pairs, 0, nullptr, nullptr, d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "group");
     const size_t col_e = q8_cols(E);
     const int rows_max = T * K;   // this window's pairs (the buffers hold max_pairs_, a prompt window's)
-    gather_q8(d.q8_x, d.pair_tok, d.cnt + 2, d.q8_g, (int) col_e, rows_max, d.stream);
+    // the decode window's Q2_K products on the WMMA kernel (gfx11; 2.5-4x the grouped MMVQ's bandwidth): the pairs'
+    // activations quantized per 256 as the prompt path does, the sums packed once per (pair, super-block)
+    const bool decq2k = d.q2k_packed && !kNoDecQ2K && rows_max <= 64 && L.exp_gate.type == 10 && L.exp_up.type == 10 && L.exp_down.type == 10 &&
+                        FF % 128 == 0 && E % 256 == 0 && FF % 256 == 0 && E % 128 == 0;
+    if (decq2k) {
+        strata::glm5::q2k::quantize_act(xn, d.pair_tok, rows_max, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream);
+        strata::glm5::q2k::pack_sums(d.q2k_sums, rows_max, E, d.q2k_packed, d.stream);
+    } else gather_q8(d.q8_x, d.pair_tok, d.cnt + 2, d.q8_g, (int) col_e, rows_max, d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "gather");
     prof_mark(d, "router+group");
     if (!doorbell && !all_resident) {
@@ -1313,8 +1330,16 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     // zero = the start of the group list (cnt[4] == 0), cnt[0] = the first missed group, cnt[1] = the end
     const int* g0 = d.cnt + 4;
     // the hits: groups [0, cnt[0]) - gate then up
-    strata::kernels::native_mmvq_grouped((int) L.exp_gate.type, d.grp_w, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt, d.ffn_g, E, FF, max_pairs_, d.stream);
-    strata::kernels::native_mmvq_grouped((int) L.exp_up.type, d.grp_wu, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt, d.ffn_u, E, FF, max_pairs_, d.stream);
+    auto gate_up = [&](const int* gb, const int* ge) {
+        if (decq2k) {
+            strata::glm5::q2k::dec_wmma(d.grp_w, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_g, E, FF, d.stream);
+            strata::glm5::q2k::dec_wmma(d.grp_wu, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_u, E, FF, d.stream);
+        } else {
+            strata::kernels::native_mmvq_grouped((int) L.exp_gate.type, d.grp_w, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.ffn_g, E, FF, max_pairs_, d.stream);
+            strata::kernels::native_mmvq_grouped((int) L.exp_up.type, d.grp_wu, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.ffn_u, E, FF, max_pairs_, d.stream);
+        }
+    };
+    gate_up(g0, d.cnt);
     prof_mark(d, "moe_hits");
     if (doorbell) moe_wait(d.db_flag_d + il, d.tok_dev, d.stream);
     prof_mark(d, "moe_wait");
@@ -1323,12 +1348,17 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
         moe_place(d.cnt, d.grp_miss, d.grp_e, d.miss_slot_d + (size_t) il * t_chunk_ * K, d.miss_out_d + (size_t) il * t_chunk_ * K, slots, blob,
                   L.exp_gate.stride, L.exp_up.stride, d.grp_w, d.grp_wu, d.grp_wd, const_cast<int32_t*>(slot_of), d.stream);
     // the misses: groups [cnt[0], cnt[1]) (in cpu mode the CPU-served groups have ncols 0: their pair rows came from the host)
-    strata::kernels::native_mmvq_grouped((int) L.exp_gate.type, d.grp_w, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, d.cnt, d.cnt + 1, d.ffn_g, E, FF, max_pairs_, d.stream);
-    strata::kernels::native_mmvq_grouped((int) L.exp_up.type, d.grp_wu, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, d.cnt, d.cnt + 1, d.ffn_u, E, FF, max_pairs_, d.stream);
+    gate_up(d.cnt, d.cnt + 1);
     prof_mark(d, "moe_misses");
     swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream);
-    strata::kernels::native_quantize_q8_1(d.ffn_h, d.q8_h, FF * rows_max, 1, d.stream);   // this window's pair rows in one launch
-    strata::kernels::native_mmvq_grouped((int) L.exp_down.type, d.grp_wd, d.q8_h, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.ffn_y, FF, E, max_pairs_, d.stream);
+    if (decq2k) {
+        strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream);
+        strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream);
+        strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
+    } else {
+        strata::kernels::native_quantize_q8_1(d.ffn_h, d.q8_h, FF * rows_max, 1, d.stream);   // this window's pair rows in one launch
+        strata::kernels::native_mmvq_grouped((int) L.exp_down.type, d.grp_wd, d.q8_h, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.ffn_y, FF, E, max_pairs_, d.stream);
+    }
     if (cpu) moe_wait(d.db_flag2_d + il, d.tok_dev, d.stream);   // the CPU's rows for its pairs are in ffn_y
     // the pairs of a token summed in the router's top-k order: the same bits whichever experts happen to be resident
     // (the pair list puts the hits first, so its order moves with the residency)
@@ -1444,7 +1474,7 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     uint8_t* buf = (prompt_mode_ && !all_resident) ? experts_->win_buf(di, k) : nullptr;
     const auto th0 = std::chrono::steady_clock::now();
     const auto th1 = std::chrono::steady_clock::now();
-    moe_group(d.ids, d.wts, T, K, hp_.n_expert, slot_of, slots, blob, L.exp_gate.stride, L.exp_up.stride, buf, blob, d.grp_w, d.grp_wu,
+    moe_group(d.ids, d.wts, T, K, hp_.n_expert, slot_of, slots, blob, L.exp_gate.stride, L.exp_up.stride, buf, blob, nullptr, d.grp_w, d.grp_wu,
               d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, d.pair_tok, d.pair_w, d.cnt, d.grp_e, d.grp_miss, false, nullptr, d.tok_pairs, n_slots,
               d.bounds_res, d.bounds_miss, d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "group");
@@ -1616,6 +1646,7 @@ void Engine::forward_window_impl(const int32_t* tokens, int T, const DumpFn& dum
     // each layer on its prefetch
     prompt_mode_ = doorbell_ && T >= kMmqMinT && devs_[0].mmq && experts_->win_bufs() > 0;
     mid_mode_ = prompt_mode_ && T < kPrefetchAllMinT;
+    if (prompt_mode_ && experts_ && experts_->loans_on()) drop_loans();   // the ring is the prompt path's again
     cpu_mode_ = doorbell_ && !prompt_mode_ && T <= 8 && cpu_misses_ && experts_->cpu_ready();
     if (!prompt_mode_ && kNoDoorbell) doorbell_ = false;
     if (prompt_mode_) ring_parity_ ^= 1;
@@ -1806,6 +1837,11 @@ void Engine::stage_main(size_t di) {
     }
 }
 
+void Engine::drop_loans() {
+    for (auto& dd : devs_) { check(cudaSetDevice(dd.ordinal), "cudaSetDevice"); check(cudaStreamSynchronize(S(dd.stream)), "loan drop sync"); }
+    experts_->reset_loans();
+}
+
 void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, const std::function<void(int, int, bool)>& on_window) {
     if (slot < 0 || slot > n_slots_) throw std::runtime_error("glm5: no slot " + std::to_string(slot));
     if (n <= 0) return;
@@ -1826,6 +1862,7 @@ void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, c
     }
     // every window a prompt window on the ring; the stages run them as a pipeline
     if (db_failed_.load(std::memory_order_acquire)) throw std::runtime_error(db_err_);
+    if (experts_ && experts_->loans_on()) drop_loans();
     rows_mode_ = false; swaps_now_ = 0; doorbell_ = true; prompt_mode_ = true; mid_mode_ = false; cpu_mode_ = false;
     db_active_.store(false, std::memory_order_release);
     std::vector<std::unique_ptr<Job>> jobs;

@@ -82,6 +82,8 @@ void swiglu_clamp(const float* g, const float* u, float* h, int n, float limit, 
 void moe_publish(const int32_t* ids, int k, const uint32_t* tok, int32_t* h_ids, uint32_t* h_published, const float* x, int nx, float* h_x, void* stream);   ///< ids (and nx floats of x) to the host, then the flag
 /// The doorbell flag (device view of the mapped word) written by a kernel on `stream`, after the copies queued before it.
 void write_flag(uint32_t* flag_dev, uint32_t v, void* stream);
+/// n floats (n % 4 == 0) from mapped pinned host memory (its device pointer) into device memory, by a kernel
+void copy_host_rows(const float* src_mapped, float* dst, size_t n, void* stream);
 /// The T tokens' MoE inputs ([T][n] floats) to mapped host memory (before moe_publish on the same stream).
 void publish_x(const float* x, int T, int n, float* h_x, void* stream);
 /// The dispatch tables, hits first (see kernels.cu): tabA/rowsA the hits' gate+up, tabB/rowsB the misses', tabC the downs,
@@ -131,8 +133,10 @@ void router_sigmoid_topk_t(const float* logits, const float* bias, int T, int n_
                            float* weights, float* probs, void* stream);
 /// The window's MoE dispatch (see kernels.cu k_moe_group): T*K pairs grouped by expert, resident groups first.
 /// cnt = {n_hit_groups, n_groups, n_pairs, n_missed_experts, 0}
+/// slot table updates for the loan slots: entries (e, j) -> slot_of[e] = kLoanBit | j, (e, -1) -> -1
+void loan_apply(const int32_t* entries, int n, int32_t* slot_of, void* stream);
 void moe_group(const int32_t* ids, const float* wts, int T, int K, int n_expert, const int32_t* slot_of, const uint8_t* slots, uint64_t blob,
-               uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const void** grp_w,
+               uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const uint8_t* const* loan_ptr, const void** grp_w,
                const void** grp_wu, const void** grp_wd, int* grp_col0, int* grp_ncols, int* grp_orow, int* pair_tok,
                float* pair_w, int* cnt, int* grp_e, int* grp_miss, bool split_hits, int* bounds, int* tok_pairs, int n_slots, int* bounds_res,
                int* bounds_miss, void* stream);   ///< !split_hits: residents in slot order (bounds_res[n_slots+1]), then the non-resident by rank (bounds_miss)

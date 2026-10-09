@@ -1260,9 +1260,13 @@ __global__ void k_router_t(const float* __restrict__ logits, const float* __rest
 //   grp_col0[g], grp_ncols[g]: the pair range of group g;  grp_orow[g] = grp_col0[g]
 //   pair_tok[p], pair_w[p]: the token and router weight of pair p (pairs ordered by group)
 //   cnt[0] = n_hit_groups, cnt[1] = n_groups, cnt[2] = n_pairs, cnt[3] = n_missed_experts
+// a slot table entry with kLoanBit set is a loan slot (the decode path's cache of missed experts in the prompt buffers):
+// its blob is at loan_ptr[entry & ~kLoanBit]
+constexpr int32_t kLoanBit = 1 << 30;
 __global__ void k_moe_group(const int32_t* __restrict__ ids, const float* __restrict__ wts, int T, int K, int n_expert,
                             const int32_t* __restrict__ slot_of, const uint8_t* __restrict__ slots, uint64_t blob,
                             uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* __restrict__ stage, uint64_t stage_bytes,
+                            const uint8_t* const* __restrict__ loan_ptr,
                             const void** __restrict__ grp_w, const void** __restrict__ grp_wu, const void** __restrict__ grp_wd,
                             int* __restrict__ grp_col0, int* __restrict__ grp_ncols, int* __restrict__ grp_orow,
                             int* __restrict__ pair_tok, float* __restrict__ pair_w, int* __restrict__ cnt,
@@ -1284,7 +1288,7 @@ __global__ void k_moe_group(const int32_t* __restrict__ ids, const float* __rest
         // the prompt path: resident experts' groups in slot order (one MMQ product over the slot buffer), then the
         // non-resident ones by their rank among all non-resident experts (the compact prefetch buffer)
         for (int e = threadIdx.x; e < n_expert; e += blockDim.x)
-            if (s_count[e] && slot_of[e] >= 0) s_inv[slot_of[e]] = e;
+            if (s_count[e] && slot_of[e] >= 0 && slot_of[e] < n_slots) s_inv[slot_of[e]] = e;   // (loans are cleared before a prompt window)
         __syncthreads();
         if (threadIdx.x == 0) {
             int g = 0, col = 0;
@@ -1333,7 +1337,8 @@ __global__ void k_moe_group(const int32_t* __restrict__ ids, const float* __rest
                 if (s_count[e] == 0) continue;
                 const int slot = slot_of[e];
                 if (split_hits && (slot >= 0) != (pass == 0)) continue;
-                const uint8_t* b = slot >= 0 ? slots + (uint64_t) slot * blob : stage + (uint64_t) nmiss * stage_bytes;
+                const uint8_t* b = slot < 0 ? stage + (uint64_t) nmiss * stage_bytes
+                                 : (slot & kLoanBit) ? loan_ptr[slot & ~kLoanBit] : slots + (uint64_t) slot * blob;
                 if (slot < 0) ++nmiss;
                 s_col0[e] = col;
                 grp_w[g] = b;
@@ -1605,13 +1610,33 @@ void router_sigmoid_topk_t(const float* logits, const float* bias, int T, int n_
                            float* weights, float* probs, void* s) {
     k_router_t<<<T, 256, 2 * n_expert * sizeof(float), S(s)>>>(logits, bias, n_expert, k, norm, scale, ids, weights, probs);
 }
+// rows from mapped pinned host memory into device memory by a kernel (the copy engines' queue is not involved: the
+// CPU's result rows must not wait behind the loan copies in flight)
+__global__ void k_copy_host_rows(const float4* __restrict__ src, float4* __restrict__ dst, size_t n4) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void copy_host_rows(const float* src_mapped, float* dst, size_t n, void* s) {
+    const size_t n4 = n / 4;
+    k_copy_host_rows<<<(unsigned) std::min<size_t>(256, (n4 + 255) / 256), 256, 0, S(s)>>>(reinterpret_cast<const float4*>(src_mapped), reinterpret_cast<float4*>(dst), n4);
+}
+// the loan table updates: entry (e, j) sets slot_of[e] = kLoanBit | j, (e, -1) clears it
+__global__ void k_loan_apply(const int32_t* __restrict__ entries, int n, int32_t* __restrict__ slot_of) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int e = entries[2 * i], j = entries[2 * i + 1];
+        slot_of[e] = j < 0 ? -1 : (kLoanBit | j);
+    }
+}
+void loan_apply(const int32_t* entries, int n, int32_t* slot_of, void* s) {
+    if (n <= 0) return;
+    k_loan_apply<<<1, 128, 0, S(s)>>>(entries, n, slot_of);
+}
 void moe_group(const int32_t* ids, const float* wts, int T, int K, int n_expert, const int32_t* slot_of, const uint8_t* slots, uint64_t blob,
-               uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const void** grp_w,
+               uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const uint8_t* const* loan_ptr, const void** grp_w,
                const void** grp_wu, const void** grp_wd, int* grp_col0, int* grp_ncols, int* grp_orow, int* pair_tok,
                float* pair_w, int* cnt, int* grp_e, int* grp_miss, bool split_hits, int* bounds, int* tok_pairs, int n_slots, int* bounds_res,
                int* bounds_miss, void* s) {
     if (n_expert > 512) throw std::runtime_error("moe_group: more than 512 experts");
-    k_moe_group<<<1, 1024, 0, S(s)>>>(ids, wts, T, K, n_expert, slot_of, slots, blob, gate_bytes, up_bytes, stage, stage_bytes, grp_w, grp_wu,
+    k_moe_group<<<1, 1024, 0, S(s)>>>(ids, wts, T, K, n_expert, slot_of, slots, blob, gate_bytes, up_bytes, stage, stage_bytes, loan_ptr, grp_w, grp_wu,
                                       grp_wd, grp_col0, grp_ncols, grp_orow, pair_tok, pair_w, cnt, grp_e, grp_miss, split_hits ? 1 : 0, bounds, tok_pairs,
                                       n_slots, bounds_res, bounds_miss);
 }
