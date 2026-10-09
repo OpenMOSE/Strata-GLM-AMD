@@ -978,3 +978,14 @@ out differently; (2) the LRU could evict a slot of a later layer of the same win
 would still read it while the new copy overwrote it. Now a loan is `loan_live` only once applied, victims come only
 from layers already served in the window, and an id out of range stops with a message. 2 x 2,500 tokens, the
 exactness test and the eight-prompt alternation pass.
+
+## Decode: the draft count per round (2026-10-10)
+
+Fixed draft counts on fresh prompts (400 tokens, loans on): TypeScript 32.6 / 34.2 / 31.0 tok/s and Rust 34.1 / 31.8 / 28.1
+for 2 / 3 / 4 drafts - the third draft pays on one answer and costs on the other (its acceptance 82% vs 71%), the
+fourth always costs. A policy on the acceptance alone (an EMA per draft position, a threshold) stayed too conservative
+(TypeScript 32.4). The policy kept (`SpecPolicy` in glm5_main.cpp) measures what matters: per draft count an EMA of the
+tokens a round produced and of its wall time, the next round takes the count with the best tokens/ms (a 2% margin),
+one round in eight tries a neighbour. With `--spec 4` as the ceiling it matched the best fixed count on both answers
+(TypeScript 34.2, Rust 34.1) while drafting 3.7 per round on average. `--spec 4` is the configs' default now;
+`STRATA_GLM5_SPEC_ADAPT=0` drafts the configured count every round.

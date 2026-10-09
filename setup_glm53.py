@@ -283,7 +283,7 @@ def main(a) -> int:
     args = ["--serve", "--gguf", str(paths[MODEL_FILE]), "--mtp", str(paths[MTP_FILE]), "--devices", devices,
             "--expert-budget-gib", ",".join(f"{b:.1f}" for b in bud),
             "--profile", str(profile), "--profile-save", str(profile),
-            "--window", "8", "--prefill-window", "4096", "--spec", "2", "--ctx", str(ctx),
+            "--window", "8", "--prefill-window", "4096", "--spec", "4", "--ctx", str(ctx),
             "--attn", "lod", "--lod-top", "128", "--lod-top-decode", "64"]
     if pin:
         args += ["--pin-gib", str(pin)]

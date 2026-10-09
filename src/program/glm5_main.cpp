@@ -76,6 +76,37 @@ struct SpecStats {
     double trunk_s = 0, mtp_s = 0;
 };
 
+// The drafts per round, chosen from the measured rate: per draft count k an EMA of the tokens a round produced and of
+// its wall time; the next round uses the k with the best tokens/ms, one round in eight trying a neighbour so both
+// estimates stay fresh (the third draft pays on some answers - TypeScript +5% - and costs on others - Rust -7%).
+// STRATA_GLM5_SPEC_ADAPT=0 drafts the configured count every round.
+struct SpecPolicy {
+    int k_max = 0, round = 0, k_cur = 2;
+    double tok[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, ms[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int seen[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    static bool on() { static const bool v = !(std::getenv("STRATA_GLM5_SPEC_ADAPT") && atoi(std::getenv("STRATA_GLM5_SPEC_ADAPT")) == 0); return v; }
+    double rate(int k) const { return ms[k] > 0 ? tok[k] / ms[k] : 0.0; }
+    int choose() {
+        if (!on() || k_max <= 2) return k_max;
+        ++round;
+        if (k_cur > k_max) k_cur = k_max;
+        const int lo = std::max(1, k_cur - 1), hi = std::min(k_max, k_cur + 1);
+        if (seen[hi] < 4 && hi != k_cur) return hi;              // an untried count: try it a few times first
+        if (round % 8 == 0) return (round / 8) % 2 ? hi : lo;    // the exploratory round
+        int best = k_cur;
+        for (int k = lo; k <= hi; ++k) if (rate(k) > rate(best) * 1.02) best = k;   // a 2% margin against noise
+        k_cur = best;
+        return best;
+    }
+    void update(int k, int n, double round_ms) {   // k drafted, n accepted, the round's wall time
+        if (k < 1 || k > 8 || round_ms <= 0) return;
+        const double a = seen[k] < 10 ? 0.3 : 0.1;
+        tok[k] += a * ((double) (n + 1) - tok[k]);
+        ms[k] += a * (round_ms - ms[k]);
+        ++seen[k];
+    }
+};
+
 // The MTP catch-up over the window positions whose next token is known, then the drafts for the next round.
 // h rows: the trunk's post-norm hidden states of the last window; next[i] = the token at position pos0 + i + 1.
 // Returns the drafts (k of them, or fewer when an EOS appears).
@@ -148,6 +179,7 @@ struct SlotSt {
     int64_t max_new = 0, produced = 0;
     double t0 = 0;
     std::vector<int32_t> drafts;      // the MTP's drafts for the tokens after `cur` (valid when mtp_ready)
+    SpecPolicy pol;                   // the drafts per round for this slot
     bool mtp_ready = false;
     SpecStats st;
 };
@@ -214,6 +246,7 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
     // one batch window: every active slot feeds its token and (the window's 8 rows shared out) its MTP drafts; the
     // accepted prefix of each slot's run is kept (the KDA states of the rest rolled back); BT lines, BDONE for the ones that end
     auto batch_step = [&]() {
+        const double tb = now_s();
         struct Grp { int slot, start, len, pos0; std::vector<int32_t> next; };
         std::vector<int32_t> toks;
         std::vector<int> rows;
@@ -251,6 +284,7 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
             while (n < g.len - 1 && toks[(size_t) (g.start + 1 + n)] == am[(size_t) (g.start + n)]) ++n;
             keep[gi] = n + 1;
             ++S0.st.rounds; S0.st.drafted += g.len - 1; S0.st.accepted += n;
+            S0.pol.update(g.len - 1, n, (now_s() - tb) * 1e3);
             for (int i = 0; i <= n; ++i) S0.processed.push_back(toks[(size_t) (g.start + i)]);
             for (int i = 0; i < n; ++i) g.next.push_back(toks[(size_t) (g.start + 1 + i)]);
             g.next.push_back(am[(size_t) (g.start + n)]);
@@ -276,7 +310,8 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
             for (const Grp& g : grps) {
                 SlotSt& S0 = slots[(size_t) g.slot];
                 if (!S0.active) continue;
-                S0.drafts = mtp_draft(eng, g.slot, eng.h_win() + (size_t) g.start * E, E, g.pos0, g.next, spec, S0.st);
+                if (S0.pol.k_max == 0) S0.pol.k_max = spec;
+                S0.drafts = mtp_draft(eng, g.slot, eng.h_win() + (size_t) g.start * E, E, g.pos0, g.next, S0.pol.choose(), S0.st);
                 S0.mtp_ready = true;
             }
     };
@@ -406,12 +441,14 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
                     for (int32_t d : drafts) win.push_back(d);
                     const int T = (int) win.size();
                     const int pos0 = eng.pos(SOLO);
+                    const double tr = now_s();
                     eng.forward_window(win.data(), T);
                     const std::vector<int32_t> am = eng.argmax_rows();
                     int n = 0;
                     while (n < (int) drafts.size() && drafts[(size_t) n] == am[(size_t) n]) ++n;
                     eng.commit(n + 1);
                     ++st.rounds; st.drafted += (int) drafts.size(); st.accepted += n;
+                    S0.pol.update((int) drafts.size(), n, (now_s() - tr) * 1e3);
                     for (int i = 0; i <= n; ++i) S0.processed.push_back(win[(size_t) i]);
                     std::vector<int32_t> next;
                     for (int i = 0; i < n; ++i) next.push_back(drafts[(size_t) i]);
@@ -426,7 +463,8 @@ int serve_loop(strata::glm5::Engine& eng, strata::glm5::ExpertStore* store, cons
                     std::fflush(stdout);
                     if (ended) { cur = -1; break; }
                     cur = am[(size_t) n];
-                    drafts = mtp_draft(eng, SOLO, eng.h_win(), E, pos0, next, spec, st);
+                    if (S0.pol.k_max == 0) S0.pol.k_max = spec;
+                    drafts = mtp_draft(eng, SOLO, eng.h_win(), E, pos0, next, S0.pol.choose(), st);
                 } else {
                     eng.forward_window(&cur, 1);
                     S0.processed.push_back(cur);
@@ -807,6 +845,7 @@ int main(int argc, char** argv) {
                 out.push_back(cur);
             }
         } else {
+            SpecPolicy pol; pol.k_max = spec;
             while ((int) out.size() < n_predict) {
                 // the window: the newest committed token, then the drafts
                 std::vector<int32_t> win;
@@ -831,12 +870,13 @@ int main(int argc, char** argv) {
                 ++st.rounds;
                 st.drafted += (int) drafts.size();
                 st.accepted += n;
+                pol.update((int) drafts.size(), n, round_ms);
                 std::vector<int32_t> next;   // the token after each kept window position
                 for (int i = 0; i < n; ++i) next.push_back(drafts[(size_t) i]);
                 next.push_back(am[(size_t) n]);
                 for (int32_t t : next) out.push_back(t);
                 cur = am[(size_t) n];
-                drafts = mtp_draft(eng, eng.solo_slot(), eng.h_win(), E, pos0, next, spec, st);
+                drafts = mtp_draft(eng, eng.solo_slot(), eng.h_win(), E, pos0, next, pol.choose(), st);
             }
             if ((int) out.size() > n_predict) out.resize((size_t) n_predict);
         }
