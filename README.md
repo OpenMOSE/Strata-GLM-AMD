@@ -202,7 +202,7 @@ runs at 15-16 tokens/s and 12K prompts at about 490 tokens/s. `"gpu": [0]`, `HIP
 | `--expert-budget-gib G[,G2]` | VRAM for resident experts per card |
 | `--pin-gib G` | the pinned-RAM limit for the non-resident experts (default 64); above it they are read from the file |
 | `--prefill-window T` | tokens per prompt window (4096 recommended; windows feed the two-card pipeline) |
-| `--window T`, `--spec K` | the decode window and the most draft tokens per round (8 and 4; each round drafts 2-4 by the measured rate, `STRATA_GLM5_SPEC_ADAPT=0` fixes K) |
+| `--window T`, `--spec K` | the decode window and the number of draft tokens (8 and 2) |
 | `--attn lod`, `--lod-top`, `--lod-top-decode`, `--lod-page`, `--lod-local`, `--lod-sink` | the windowed sparse-attention mode and its selection sizes |
 | `--slots N` (or `"parallel": N` in the config) | batch slots; 2 is the recommended maximum |
 | `--profile FILE`, `--profile-save FILE` | the expert-usage ranking read at start / saved after each request |

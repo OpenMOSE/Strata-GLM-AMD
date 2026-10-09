@@ -19,7 +19,7 @@
     "--prefill-window",
     "4096",
     "--spec",
-    "4",
+    "2",
     "--profile-save",
     "/path/to/strata-data/glm53/profile_chat_1gpu.txt",
     "--ctx",

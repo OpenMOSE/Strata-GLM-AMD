@@ -197,7 +197,7 @@ staging できません）。RAM は 128 GB が最低ラインです。decode �
 | `--expert-budget-gib G[,G2]` | 常駐エキスパートに使うカードごとの VRAM |
 | `--pin-gib G` | 非常駐エキスパートのピン留め RAM 上限（既定 64）。超えるとファイルから読む |
 | `--prefill-window T` | prompt の窓のトークン数（4096 推奨。窓が 2 枚のパイプラインに流れる） |
-| `--window T`、`--spec K` | decode の窓とラウンドあたりのドラフト上限（8 と 4。実測レートで各ラウンド 2〜4 本を選ぶ。`STRATA_GLM5_SPEC_ADAPT=0` で固定） |
+| `--window T`、`--spec K` | decode の窓とドラフトトークン数（8 と 2） |
 | `--attn lod`、`--lod-top`、`--lod-top-decode`、`--lod-page`、`--lod-local`、`--lod-sink` | 窓単位のスパース attention モードと選択のサイズ |
 | `--slots N`（設定の `"parallel": N`） | バッチスロット。推奨最大は 2 |
 | `--profile FILE`、`--profile-save FILE` | 起動時に読む / リクエストごとに保存するエキスパート使用頻度の順位 |

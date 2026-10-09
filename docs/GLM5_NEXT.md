@@ -979,13 +979,13 @@ would still read it while the new copy overwrote it. Now a loan is `loan_live` o
 from layers already served in the window, and an id out of range stops with a message. 2 x 2,500 tokens, the
 exactness test and the eight-prompt alternation pass.
 
-## Decode: the draft count per round (2026-10-10)
+## Decode: the draft count per round (2026-10-10, not adopted)
 
 Fixed draft counts on fresh prompts (400 tokens, loans on): TypeScript 32.6 / 34.2 / 31.0 tok/s and Rust 34.1 / 31.8 / 28.1
 for 2 / 3 / 4 drafts - the third draft pays on one answer and costs on the other (its acceptance 82% vs 71%), the
-fourth always costs. A policy on the acceptance alone (an EMA per draft position, a threshold) stayed too conservative
-(TypeScript 32.4). The policy kept (`SpecPolicy` in glm5_main.cpp) measures what matters: per draft count an EMA of the
-tokens a round produced and of its wall time, the next round takes the count with the best tokens/ms (a 2% margin),
-one round in eight tries a neighbour. With `--spec 4` as the ceiling it matched the best fixed count on both answers
-(TypeScript 34.2, Rust 34.1) while drafting 3.7 per round on average. `--spec 4` is the configs' default now;
-`STRATA_GLM5_SPEC_ADAPT=0` drafts the configured count every round.
+fourth always costs. Two adaptive policies were tried: a threshold on the per-position acceptance (too conservative:
+TypeScript 32.4) and the measured rate per draft count (an EMA of tokens and round time, a neighbour tried one round
+in eight), which matched the best fixed count on both answers (34.2 / 34.1) at `--spec 4`. The gain is within the
+run-to-run noise of 400-token runs (~3%) and on the server's first request the policy settled at 2 drafts; it was
+reverted to keep the decode loop simple. The configs stay at `--spec 2`. The acceptance data of the server's traffic
+(188 requests): median 72%, a third of the requests below 65% (Japanese and code answers), 2.57 tokens per round.
