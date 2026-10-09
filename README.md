@@ -234,6 +234,17 @@ and routing, and the server fixes (stop tokens, thinking off, tool calls). The r
 checked against is llama.cpp's `glm5-next`; `tools/glm_oracle/` dumps its intermediate tensors and
 `ref/glm5.py` is a numpy re-implementation.
 
+## What changed
+
+- **2026-10-10** - The draft count stays fixed at 2 per round: a per-round adaptive count (2-4 by the measured rate)
+  was tried and reverted, its gain being within the noise ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md)).
+- **2026-10-09** - Decoding: the Q2_K expert products on a WMMA kernel built for small windows (550 GB/s against
+  115-160); the decode-time expert cache in the prompt buffers (+7-19% on fresh prompts), with a consistency fix for
+  a crash it caused in long answers; the routing profile shipped with the repository and saved cumulatively across
+  sessions; `./update.sh` rebuilds the engine without questions; the per-request log line shows the cache's counters.
+- **2026-10-08** - First release: the `strata-glm5` engine for GLM-5.3-Flash on two 48 GB AMD cards, 256K context,
+  the two-card prompt pipeline, tool calls in GLM-5's format, thinking on/off, the installer (`./setup.sh --family glm53`).
+
 ## Credits and license
 
 [Strata](https://github.com/Niko1221/Strata) by Niko1221 is the base of everything here (the server, the app,
