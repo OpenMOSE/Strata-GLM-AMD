@@ -939,6 +939,41 @@ void moe_select(const int32_t* ids, const float* wts, int k, const int32_t* slot
     k_moe_select<<<1, 32, 0, S(s)>>>(ids, wts, k, slot_of, slots, blob, gate_bytes, up_bytes, stage, stage_bytes, tabA, tabB, tabC,
                                      rowsA, rowsB, wperm, cnt);
 }
+// the wait, then the served layer's bookkeeping in the same block: the CPU-served groups' columns zeroed (miss_cpu, nullable)
+// and the swapped-in misses placed (k_moe_cpu_mask + k_moe_place)
+__global__ void k_moe_wait_place(const volatile uint32_t* h_flag, const uint32_t* __restrict__ tok, const int* __restrict__ cnt,
+                                 const int* __restrict__ grp_miss, const int* __restrict__ miss_cpu, int* __restrict__ grp_ncols,
+                                 const int* __restrict__ grp_e, const int* __restrict__ miss_slot, const int* __restrict__ miss_out,
+                                 const uint8_t* __restrict__ slots, uint64_t blob, uint64_t gate_bytes, uint64_t up_bytes,
+                                 const void** __restrict__ grp_w, const void** __restrict__ grp_wu, const void** __restrict__ grp_wd,
+                                 int32_t* __restrict__ slot_of) {
+    if (threadIdx.x == 0) {
+        const uint32_t want = *tok;
+        while (*h_flag != want) { __builtin_amdgcn_s_sleep(1); }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int g = cnt[0] + threadIdx.x; g < cnt[1]; g += blockDim.x) {
+        const int m = grp_miss[g];
+        if (m < 0) continue;
+        if (miss_cpu && miss_cpu[m]) grp_ncols[g] = 0;
+        const int dst = miss_slot[m];
+        if (dst < 0) continue;
+        const uint8_t* b = slots + (uint64_t) dst * blob;
+        grp_w[g] = b;
+        grp_wu[g] = b + gate_bytes;
+        grp_wd[g] = b + gate_bytes + up_bytes;
+        const int out = miss_out[m];
+        if (out >= 0) slot_of[out] = -1;
+        slot_of[grp_e[g]] = dst;
+    }
+}
+void moe_wait_place(const uint32_t* h_flag, const uint32_t* tok, const int* cnt, const int* grp_miss, const int* miss_cpu, int* grp_ncols,
+                    const int* grp_e, const int* miss_slot, const int* miss_out, const uint8_t* slots, uint64_t blob, uint64_t gate_bytes,
+                    uint64_t up_bytes, const void** grp_w, const void** grp_wu, const void** grp_wd, int32_t* slot_of, void* s) {
+    k_moe_wait_place<<<1, 256, 0, S(s)>>>(h_flag, tok, cnt, grp_miss, miss_cpu, grp_ncols, grp_e, miss_slot, miss_out, slots, blob, gate_bytes, up_bytes,
+                                          grp_w, grp_wu, grp_wd, slot_of);
+}
 void moe_wait(const uint32_t* h_flag, const uint32_t* tok, void* s) { k_moe_wait<<<1, 32, 0, S(s)>>>(h_flag, tok); }
 void u32_inc(uint32_t* v, void* s) { k_u32_inc<<<1, 32, 0, S(s)>>>(v); }
 void pf_apply(const uint32_t* pf_flag, const uint32_t* tok, const int* pf_n, const int* pf_e, const int* pf_slot, const int* pf_out,
@@ -1266,6 +1301,31 @@ __global__ void k_mhc_finish_t(const float* __restrict__ R, const float* __restr
         const float v = xv[k] * sc2 * norm_w[i];
         xn[(size_t) t * n_embd + i] = v;
         if (xq) q8_1_warp_store(v, xq, i / 32, lane % WARP);
+    }
+}
+// k_mhc_post_t with the MoE combine folded in: y[t][i] = sum_k pair_w[s] ffn_y[s][i] (+ add[t][i]) for the pairs s of
+// token t (k_combine_tok's arithmetic), never written out
+__global__ void k_mhc_post_moe_t(const float* __restrict__ ffn_y, const float* __restrict__ pair_w, const int* __restrict__ tok_pairs, int K,
+                                 const float* __restrict__ add, const float* __restrict__ R_in, const float* __restrict__ post,
+                                 const float* __restrict__ comb, float* __restrict__ R_out, int n_embd, int hc) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) {
+        const int s = tok_pairs[t * K + k];
+        acc += pair_w[s] * ffn_y[(size_t) s * n_embd + i];
+    }
+    if (add) acc = acc + add[(size_t) t * n_embd + i];
+    const float* Rt = R_in + (size_t) t * hc * n_embd;
+    float* Ro = R_out + (size_t) t * hc * n_embd;
+    float r[8];
+    for (int s = 0; s < hc; ++s) r[s] = Rt[(size_t) s * n_embd + i];
+    const float yi = acc;
+    for (int d = 0; d < hc; ++d) {
+        float a = yi * post[t * hc + d];
+        for (int s = 0; s < hc; ++s) a += r[s] * comb[t * hc * hc + s * hc + d];
+        Ro[(size_t) d * n_embd + i] = a;
     }
 }
 // KDA conv over T tokens, sequential per channel; the window state after every token goes to snap[t] (rollback).
@@ -1964,6 +2024,10 @@ void mhc_pre_apply_t(const float* R, const float* pre, float* x, int T, int n_em
 void mhc_post_t(const float* y, const float* R_in, const float* post, const float* comb, float* R_out, int T, int n_embd, int hc,
                 void* s) {
     k_mhc_post_t<<<dim3(blocks_for(n_embd), T), 256, 0, S(s)>>>(y, R_in, post, comb, R_out, n_embd, hc);
+}
+void mhc_post_moe_t(const float* ffn_y, const float* pair_w, const int* tok_pairs, int K, const float* add, const float* R_in, const float* post,
+                    const float* comb, float* R_out, int T, int n_embd, int hc, void* s) {
+    k_mhc_post_moe_t<<<dim3(blocks_for(n_embd), T), 256, 0, S(s)>>>(ffn_y, pair_w, tok_pairs, K, add, R_in, post, comb, R_out, n_embd, hc);
 }
 void bf16_gemv_narrow_t(const float* x, int ldx, const uint16_t* w, float* y, int n_in, int n_out, int T, void* s) {
     if (n_in % 8 || n_in > 256 || T < 1 || T > 8) throw std::runtime_error("bf16_gemv_narrow_t: n_in % 8 == 0 and <= 256, 1..8 columns");

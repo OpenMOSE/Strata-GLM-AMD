@@ -236,6 +236,10 @@ checked against is llama.cpp's `glm5-next`; `tools/glm_oracle/` dumps its interm
 
 ## What changed
 
+- **2026-10-13 (evening)** - Small gains, pass 4: three more exact fusions (swiglu + quantizer, the combine in the mHC
+  post-mix, the wait with the placement) and the miss split rebalanced (the split model's hiding estimates at 0.4 / 0.4
+  ms), so more misses go to the PCIe side and become loans: hits 77 -> 80%, a decode round the same to 5% faster by
+  prompt ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md)).
 - **2026-10-13 (later)** - Small gains, pass 3, the decode round: the KDA layer's projections stacked and its scan fused
   with its gates and norms, the mHC tail in one launch, the resident experts' down product and the shared experts
   computed while the GPU waits for the CPU-served experts, the producers writing their own q8 rows, the decode-time

@@ -58,6 +58,9 @@ constexpr int kQkvFuseT = 64;    // windows up to this many rows take the KDA q 
 constexpr int kFabT = 16;
 constexpr int kShT = 64;         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
 static const bool kQ8Fuse = !std::getenv("STRATA_GLM5_Q8_FUSE") || std::atoi(std::getenv("STRATA_GLM5_Q8_FUSE")) != 0;   // 0: the producers do not quantize (a separate quantize per Q8_0 product)
+static const bool kWaitFuse = !std::getenv("STRATA_GLM5_WAIT_FUSE") || std::atoi(std::getenv("STRATA_GLM5_WAIT_FUSE")) != 0;   // 0: the wait, mask and place as three launches
+static const bool kCombineFuse = !std::getenv("STRATA_GLM5_COMBINE_FUSE") || std::atoi(std::getenv("STRATA_GLM5_COMBINE_FUSE")) != 0;   // 0: the combine as its own launch
+static const bool kSwigluFuse = !std::getenv("STRATA_GLM5_SWIGLU_FUSE") || std::atoi(std::getenv("STRATA_GLM5_SWIGLU_FUSE")) != 0;   // 0: the swiglu rows written, then quantized
 static const bool kPackFuse = !std::getenv("STRATA_GLM5_PACK_FUSE") || std::atoi(std::getenv("STRATA_GLM5_PACK_FUSE")) != 0;   // 0: the sums packed by a separate launch
 static const bool kRollbackTable = !std::getenv("STRATA_GLM5_ROLLBACK_TABLE") || std::atoi(std::getenv("STRATA_GLM5_ROLLBACK_TABLE")) != 0;   // 0: the rollback as memcpys
 static const bool kNarrowBf16 = !std::getenv("STRATA_GLM5_NARROW_BF16") || std::atoi(std::getenv("STRATA_GLM5_NARROW_BF16")) != 0;   // 0: the generic BF16 kernel for narrow weights
@@ -1504,25 +1507,38 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
         else gemv(d, T, L.sh_down, h_buf, d.ffn_d, SF, E);
     };
     if (early) {
+        if (kSwigluFuse) strata::glm5::q2k::swiglu_quantize(d.ffn_g, d.ffn_u, d.cnt + 2, rows_max, FF, limit, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.stream, nullptr, d.cnt + 6);
+        else {
         swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 6, rows_max, FF, limit, d.stream);
         strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream, nullptr, d.cnt + 6, kPackFuse ? d.dec_packed_h : nullptr);
         if (!kPackFuse) strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream, nullptr, d.cnt + 6);
+        }
         strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
         shared_experts(d.sh_g, d.sh_h);
     }
+    if (doorbell && experts_ && !all_resident && kWaitFuse) {   // the wait with the served layer's bookkeeping in one launch
+        moe_wait_place(d.db_flag_d + il, d.tok_dev, d.cnt, d.grp_miss, cpu ? d.miss_cpu_d + (size_t) il * 64 : nullptr, d.grp_ncols, d.grp_e,
+                       d.miss_slot_d + (size_t) il * t_chunk_ * K, d.miss_out_d + (size_t) il * t_chunk_ * K, slots, blob, L.exp_gate.stride, L.exp_up.stride,
+                       d.grp_w, d.grp_wu, d.grp_wd, const_cast<int32_t*>(slot_of), d.stream);
+        prof_mark(d, "moe_wait");
+    } else {
     if (doorbell) moe_wait(d.db_flag_d + il, d.tok_dev, d.stream);
     prof_mark(d, "moe_wait");
     if (cpu) moe_cpu_mask(d.cnt, d.grp_miss, d.miss_cpu_d + (size_t) il * 64, d.grp_ncols, d.stream);
     if (experts_ && !all_resident)
         moe_place(d.cnt, d.grp_miss, d.grp_e, d.miss_slot_d + (size_t) il * t_chunk_ * K, d.miss_out_d + (size_t) il * t_chunk_ * K, slots, blob,
                   L.exp_gate.stride, L.exp_up.stride, d.grp_w, d.grp_wu, d.grp_wd, const_cast<int32_t*>(slot_of), d.stream);
+    }
     // the misses: groups [cnt[0], cnt[1]) (in cpu mode the CPU-served groups have ncols 0: their pair rows came from the host)
     gate_up(d.cnt, d.cnt + 1);
     prof_mark(d, "moe_misses");
     if (early) {
+        if (kSwigluFuse) strata::glm5::q2k::swiglu_quantize(d.ffn_g, d.ffn_u, d.cnt + 2, rows_max, FF, limit, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.stream, d.cnt + 6, nullptr);
+        else {
         swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream, d.cnt + 6);
         strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream, d.cnt + 6, nullptr, kPackFuse ? d.dec_packed_h : nullptr);
         if (!kPackFuse) strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream, d.cnt + 6, nullptr);
+        }
         strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, d.cnt, d.cnt + 1, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
     } else {
         swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream);
@@ -1538,8 +1554,9 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     if (cpu) moe_wait(d.db_flag2_d + il, d.tok_dev, d.stream);   // the CPU's rows for its pairs are in ffn_y
     // the pairs of a token summed in the router's top-k order: the same bits whichever experts happen to be resident
     // (the pair list puts the hits first, so its order moves with the residency)
-    if (early) {   // the shared experts' rows added in the combine, the result straight into out
-        combine_tok(d.ffn_y, d.pair_w, d.tok_pairs, K, out, T, E, d.stream, d.ffn_d);
+    if (early) {   // the shared experts' rows added in the combine: by the mHC post-mix kernel (out == d.y) or here
+        if (out == d.y && kCombineFuse) d.moe_pend = true;
+        else combine_tok(d.ffn_y, d.pair_w, d.tok_pairs, K, out, T, E, d.stream, d.ffn_d);
         prof_mark(d, "moe_down");
         prof_mark(d, "shared_experts");
         return;
@@ -1950,7 +1967,8 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         } else moe(d, il, Tc, d.xn, d.y, doorbell_, dl, last);
         if (kDebugSync) debug_sync(d.stream, il, il < hp_.n_dense_lead ? "dense ffn" : "moe");
         if (il < hp_.n_dense_lead) prof_mark(d, "dense_ffn");
-        mhc_post_t(d.y, Rc, d.post, d.comb, Rc, Tc, E, hp_.hc, d.stream);
+        if (d.moe_pend) { mhc_post_moe_t(d.ffn_y, d.pair_w, d.tok_pairs, hp_.n_expert_used, d.ffn_d, Rc, d.post, d.comb, Rc, Tc, E, hp_.hc, d.stream); d.moe_pend = false; }
+        else mhc_post_t(d.y, Rc, d.post, d.comb, Rc, Tc, E, hp_.hc, d.stream);
         if (dl) dl("l_out", Rc, {hp_.hc, E}, false, dv);
         }   // chunks
         if (kDebugSync) {

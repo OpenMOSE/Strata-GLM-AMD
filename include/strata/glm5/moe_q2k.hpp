@@ -34,6 +34,10 @@ void dec_grouped(const void* const* wp, const int* col0, const int* ncols, const
 /// [cols][K/256], sums [cols][K/16]) with the sums packed once per (column, super-block) by pack_sums (packed [cols][K/256][8]);
 /// then y[(orow[g] + c) * n_out + r] = w_g[r] . act[col0[g] + c] for the groups [*g_begin, *g_end), c < ncols[g] <= 16.
 void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* stream, const int* row_lo = nullptr, const int* row_hi = nullptr);
+/// swiglu (clamped at `limit` when > 0) of the gate / up rows [*row_lo, min(*row_hi, *n_rows)) quantized to codes / scales / packed sums
+/// (as quantize_act + pack_sums of the swiglu rows would); the grid covers rows_max rows
+void swiglu_quantize(const float* g, const float* u, const int* n_rows, int rows_max, int K, float limit, int8_t* codes, float* scales, int32_t* packed,
+                     void* stream, const int* row_lo = nullptr, const int* row_hi = nullptr);
 void dec_wmma(const void* const* wp, const int* col0, const int* ncols, const int* orow, const int* g_begin, const int* g_end,
               const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* stream);
 }  // namespace strata::glm5::q2k

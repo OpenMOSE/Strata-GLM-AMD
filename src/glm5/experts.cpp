@@ -1201,7 +1201,14 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
         double dma_t = 0;
         for (;;) {
             int best = -1;
-            for (size_t i = 0; i < miss_e.size(); ++i) if (on_cpu[i] && (best < 0 || pairs_of[i] > pairs_of[(size_t) best])) best = (int) i;
+            // the most pairs first (the CPU time they save); among equals the expert routed most often so far (the
+            // PCIe side's blob becomes a loan: a frequent expert's loan is the one that gets hit again)
+            for (size_t i = 0; i < miss_e.size(); ++i) {
+                if (!on_cpu[i]) continue;
+                if (best < 0 || pairs_of[i] > pairs_of[(size_t) best] ||
+                    (pairs_of[i] == pairs_of[(size_t) best] && counts_[(size_t) il][(size_t) miss_e[i]] > counts_[(size_t) il][(size_t) miss_e[(size_t) best]]))
+                    best = (int) i;
+            }
             if (best < 0) break;
             const double cpu_after = cpu_t - pairs_of[(size_t) best] * cpu_pair_ms_, dma_after = dma_t + dma_ms_;
             if (wait_of(cpu_after, dma_after) >= wait_of(cpu_t, dma_t)) break;

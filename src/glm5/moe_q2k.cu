@@ -367,6 +367,48 @@ __global__ void __launch_bounds__(kThreads) k_dec_wmma(const void* const* __rest
 
 bool available() { return STRATA_Q2K_WMMA != 0 || true; }
 
+// swiglu(gate, up) of the pair rows [max(*row_lo, 0), min(*row_hi, *n_rows)) quantized straight to the down product's
+// operands (the same arithmetic as k_swiglu_clamp_rows then k_quant_act; the h rows are never written)
+__global__ void k_swiglu_quant_act(const float* __restrict__ g, const float* __restrict__ u, const int* __restrict__ n_rows, int K, float limit,
+                                   int8_t* __restrict__ codes, float* __restrict__ scales, int32_t* __restrict__ packed,
+                                   const int* __restrict__ row_lo, const int* __restrict__ row_hi) {
+    __shared__ float red[8];
+    __shared__ int s16[16];
+    const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x;
+    if (row >= *n_rows || (row_lo && row < *row_lo) || (row_hi && row >= *row_hi)) return;
+    const size_t o = (size_t) row * K + k;
+    const float gv = g[o], uv = u[o];
+    const float gc = limit > 0.f ? fminf(gv, limit) : gv;
+    const float v = limit > 0.f ? gc / (1.f + expf(-gc)) * fminf(fmaxf(uv, -limit), limit) : gc / (1.f + expf(-gc)) * uv;
+    float am = fabsf(v);
+    for (int o2 = 16; o2 > 0; o2 >>= 1) am = fmaxf(am, __shfl_xor(am, o2, 32));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
+    __syncthreads();
+    am = red[0];
+    for (int w = 1; w < 8; ++w) am = fmaxf(am, red[w]);
+    const float d = am / 127.f, inv = am > 0.f ? 127.f / am : 0.f;
+    const int qv = __float2int_rn(v * inv);
+    codes[(size_t) row * K + k] = (int8_t) qv;
+    int sm = qv;
+    for (int o2 = 8; o2 > 0; o2 >>= 1) sm += __shfl_xor(sm, o2, 32);
+    if (threadIdx.x == 0) scales[(size_t) row * (K / 256) + blk] = d;
+    if ((threadIdx.x & 15) == 0) s16[threadIdx.x >> 4] = sm;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        const int i = threadIdx.x;
+        uint32_t pv = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) { const int xq = s16[4 * (i & 3) + t]; pv |= (uint32_t) ((i < 4 ? xq : (xq >> 8)) & 0xff) << (8 * t); }
+        packed[((size_t) row * (K / 256) + blk) * 8 + i] = (int32_t) pv;
+    }
+}
+void swiglu_quantize(const float* g, const float* u, const int* n_rows, int rows_max, int K, float limit, int8_t* codes, float* scales, int32_t* packed,
+                     void* s, const int* row_lo, const int* row_hi) {
+    if (K % 256) throw std::runtime_error("q2k: K must be a multiple of 256");
+    if (rows_max <= 0) return;
+    k_swiglu_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows_max), 256, 0, S(s)>>>(g, u, n_rows, K, limit, codes, scales, packed, row_lo, row_hi);
+}
+
 void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* s, const int* row_lo,
                   const int* row_hi, int32_t* packed) {
     if (K % 256) throw std::runtime_error("q2k: K must be a multiple of 256");

@@ -95,6 +95,10 @@ void moe_select(const int32_t* ids, const float* wts, int k, const int32_t* slot
                 uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const void** tabA,
                 const void** tabB, const void** tabC, int* rowsA, int* rowsB, float* wperm, int* cnt, void* stream);
 void moe_wait(const uint32_t* h_flag, const uint32_t* tok, void* stream);
+/// the wait, then moe_cpu_mask (miss_cpu nullable) and moe_place in the same launch
+void moe_wait_place(const uint32_t* h_flag, const uint32_t* tok, const int* cnt, const int* grp_miss, const int* miss_cpu, int* grp_ncols,
+                    const int* grp_e, const int* miss_slot, const int* miss_out, const uint8_t* slots, uint64_t blob, uint64_t gate_bytes,
+                    uint64_t up_bytes, const void** grp_w, const void** grp_wu, const void** grp_wd, int32_t* slot_of, void* stream);
 void u32_inc(uint32_t* v, void* stream);
 /// The lookahead prefetch's placement (device views of mapped records): wait for pf_flag == *tok, apply n swaps.
 void pf_apply(const uint32_t* pf_flag, const uint32_t* tok, const int* pf_n, const int* pf_e, const int* pf_slot, const int* pf_out,
@@ -128,6 +132,9 @@ void mhc_dec_t(const float* R, const float* fn, const float* scale, const float*
                float* comb, const float* norm_w, float* x, float* xn, uint8_t* xn_q8, int T, int n_embd, int hc, int iters, float eps_rms, float eps_hc, void* stream);
 void mhc_post_t(const float* y, const float* R_in, const float* post, const float* comb, float* R_out, int T, int n_embd, int hc,
                 void* stream);
+/// mhc_post_t with the MoE combine folded in (y = the pairs' weighted sum + add, as combine_tok makes it)
+void mhc_post_moe_t(const float* ffn_y, const float* pair_w, const int* tok_pairs, int K, const float* add, const float* R_in, const float* post,
+                    const float* comb, float* R_out, int T, int n_embd, int hc, void* stream);
 /// up to three output rows of one launch (the q | k | v segments of a fused product)
 struct Ptr3 { float* p[3]; };
 /// one device-to-device copy of a table (n floats, both ends 16-byte aligned, n % 4 == 0)

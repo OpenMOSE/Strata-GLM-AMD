@@ -1073,3 +1073,24 @@ The slots-test's solo decode with the CPU service off: 84.0 -> 74.7 ms/token. Pr
 430 tokens 2.59 s, 1064 tokens 3.26 s, the 1064-token output identical). The remaining round: ~43 ms in the wait for
 the CPU-served experts (memory-bus bound), ~12 ms of Q8_0 dense products, ~10 ms of Q2_K expert products, ~11 ms of
 launch gaps.
+
+## Small gains, pass 4: the miss split (2026-10-13)
+
+- **Three more fusions**, all bit-identical (`STRATA_GLM5_SWIGLU_FUSE`, `_COMBINE_FUSE`, `_WAIT_FUSE` = 0 restore): the
+  Q2_K path's swiglu and activation quantizer as one kernel (the h rows never written), the pair combine folded into the
+  mHC post-mix kernel, the doorbell wait kernel doing the served layer's bookkeeping (the CPU mask and the placement)
+  after its spin. 228 launches per round fewer; the round time did not move - launches before the doorbell wait are
+  hidden under it, and the wait is the round.
+- **What the wait is.** The copy counters (now in the CLI's last line) put the PCIe side at ~130 MB per round (~9 ms of
+  DMA) while the CPU served ~180 pairs (~44 ms): the split model believed the device had 1.0 ms of its own work to hide
+  the CPU's time per layer (`gpu_before_cpu_ms_`), which is no longer so with the early MoE order, so it kept nearly
+  every miss on the CPU. Raising the PCIe share with the adaptive swaps on backfired (swapped-in misses evicted useful
+  residents: 91 ms per round at 64% hits); with the swaps off and 0.4 / 0.4 ms for both hiding estimates the round went
+  67.6 -> 65.3 ms and the hits 77.3 -> 80.2% (the loans made per 200 tokens 1,325 -> 2,355). Pushed further (0.3 / 0.6,
+  0.5 / 1.0) the DMA side becomes the long pole (70-72 ms). With the swaps kept on, 0.4 / 0.4 gives 67.1 ms and 80.9%
+  (434 thrashed misses) - the same within the run-to-run noise (+-2 ms: the same settings measured 65.3 and 67.6 on one
+  prompt, and 65.9 -> 62.6 on another). The new defaults are 0.4 / 0.4 with the swaps on: the plain serve path (the CPU
+  service off, the slots-test's mode) makes no loans at all, so the swaps are its only adaptation (hits 95 -> 60% without
+  them). A drafts-per-round check on two prompts kept `--spec 2` (spec 1: 29.8 / 32.8, spec 2: 35.2 / 35.7, spec 3:
+  33.4 / 35.7 tok/s).
+- Also: among misses with equal pair counts the one routed most often goes to the PCIe side (its blob becomes the loan).

@@ -255,7 +255,7 @@ private:
     FILE* route_log_ = nullptr;   ///< STRATA_GLM5_ROUTE_LOG=<path>: the decode routing per window (T tok layer ids...) and the resident sets (S layer ids...)
     double cpu_pair_ms_ = 0.9;    ///< the CPU's cost of one missed pair (ms of all threads together); tuned by measurement
     double dma_ms_ = 0.65;         ///< one expert blob over PCIe
-    double gpu_before_dma_ms_ = 0.4, gpu_before_cpu_ms_ = 1.0;   ///< the device's own work before each wait (the overlap budgets)
+    double gpu_before_dma_ms_ = 0.4, gpu_before_cpu_ms_ = 0.4;   ///< the device's own work before each wait (the overlap budgets; 0.4 / 0.4 measured best with the loan pool: 1.0 on the CPU side under-fed the PCIe side)
     bool cpu_pair_fixed_ = false;
     std::vector<float> clamp_limit_;   ///< per layer: the swiglu clamp (0 = none)
     std::vector<strata::kernels::cpu::NativeFmt> fmt_;   ///< per layer: ggml-cpu geometry of its expert blobs

@@ -473,7 +473,7 @@ int main(int argc, char** argv) {
     std::string gguf, tokens_arg, dump_dir, profile, profile_save, devices_arg = "0", split_arg = "auto", budget_arg, prompts_file, mtp_path, eos_arg;
     bool serve = false;
     int admit_window = 32;
-    int n_predict = 0, ctx = 4096, window = 8, pwin = 2048, spec = -1, adapt = 64, lookahead = 0, n_slots = 0, slots_test = 0;
+    int n_predict = 0, ctx = 4096, window = 8, pwin = 2048, spec = -1, adapt = 64, lookahead = 0, n_slots = 0, slots_test = 0;   // (the batch rows get no loans yet: the swaps are their only adaptation)
     double pin_gib = 64, evict_pool_gib = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -844,7 +844,7 @@ int main(int argc, char** argv) {
         std::printf("tokens:");
         for (int32_t t : out) std::printf(" %d", t);
         std::printf("\n%zu tokens in %.2f s = %.1f tok/s (%.1f ms/token)\n", out.size(), gen_s, out.size() / gen_s, gen_s / out.size() * 1e3);
-        if (store) std::printf("experts: %llu distinct misses, %llu thrash; cpu %llu pairs in %.0f ms (%.2f ms/pair); file reads %llu; loans %llu hits, %llu made\n", (unsigned long long) store->distinct_misses(), (unsigned long long) store->thrash(), (unsigned long long) store->cpu_pairs(), store->cpu_ms(), store->cpu_pairs() ? store->cpu_ms() / store->cpu_pairs() : 0.0, (unsigned long long) store->file_reads(), (unsigned long long) store->loan_hits(), (unsigned long long) store->loans_made());
+        if (store) std::printf("experts: %llu distinct misses, %llu thrash; cpu %llu pairs in %.0f ms (%.2f ms/pair); file reads %llu; loans %llu hits, %llu made; copies %.0f MB in %.0f ms\n", (unsigned long long) store->distinct_misses(), (unsigned long long) store->thrash(), (unsigned long long) store->cpu_pairs(), store->cpu_ms(), store->cpu_pairs() ? store->cpu_ms() / store->cpu_pairs() : 0.0, (unsigned long long) store->file_reads(), (unsigned long long) store->loan_hits(), (unsigned long long) store->loans_made(), store->copy_bytes() / 1e6, store->copy_ms());
         if (store) { const double* ph = store->cpu_phase_ms(); std::printf("cpu phases over %llu calls: split %.0f, quant x %.0f, gate/up %.0f, quant h %.0f, down %.0f, enqueue %.0f ms\n", (unsigned long long) store->cpu_calls(), ph[0], ph[1], ph[2], ph[3], ph[4], ph[5]); }
         if (st.rounds)
             std::printf("speculation: %d rounds, %d drafted, %d accepted (%.2f per round, %.1f%%), %.2f tokens/round; trunk %.2f s, mtp %.2f s\n",

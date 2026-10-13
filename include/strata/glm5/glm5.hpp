@@ -270,6 +270,7 @@ public:
         float* dense_gu = nullptr;                 // a dense layer's gate | up product for a decode window
         uint8_t* q8_sh = nullptr;                  // the shared experts' h as q8_1 rows (written by their swiglu)
         const uint8_t* xn_q8 = nullptr;            // xn's q8_1 rows when the kernel that wrote xn quantized it too (else null)
+        bool moe_pend = false;                     // the MoE combine left to the mHC post-mix kernel (ffn_y, pair_w, tok_pairs, ffn_d)
         CopyEnt* copy_tab_h = nullptr; CopyEnt* copy_tab_d = nullptr;   // the rollback copies' table (mapped pinned, two sets)
         int copy_cap = 0, copy_n = 0, copy_par = 0;
         struct Lend { uint8_t* base; uint64_t bytes, skip; };
