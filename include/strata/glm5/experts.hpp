@@ -157,10 +157,16 @@ public:
     bool loans_on() const { return loan_on_; }
     const uint8_t* const* loan_ptrs(int device_index) const { return loan_ptr_d_.empty() ? nullptr : loan_ptr_d_[(size_t) device_index]; }
     void apply_loans(int il, void* stream);        ///< the pending slot table updates of layer il (on the layer's device, before its grouping)
-    void reset_loans();                            ///< every loan dropped (the host syncs the devices first)
+    /// the loans dropped (the host syncs the devices first): every one, or - keep_scratch - only the ring's and the
+    /// whole-buffer regions' (class 0); the scratch tails' (class 1) survive a short prompt window, parked: the device
+    /// table goes back to the resident slots for that window (its grouping knows no loans), unpark_loans() brings them back
+    void reset_loans(bool keep_scratch = false);
+    void unpark_loans();                           ///< the parked loans into the device tables again (before a decode window)
+    bool loans_parked() const { return loans_parked_; }
     /// more loan slots carved from a device buffer the decode windows leave idle (bytes [skip, bytes) of base; a prompt
-    /// window drops every loan before it uses the buffer); finalize_loans() uploads the tables once all are added
-    void add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip);
+    /// window drops the class-0 loans before it uses the buffer, the class-1 tails lie past what a short prompt writes);
+    /// finalize_loans() uploads the tables once all are added
+    void add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip, int cls);   ///< cls 0: dropped at any prompt window; 1: survives short ones
     void finalize_loans();
     uint64_t loan_hits() const { return loan_hits_; }
     uint64_t promotions() const { return promotions_; }   ///< loans swapped into resident slots
@@ -234,6 +240,8 @@ private:
     bool loan_on_ = false;
     uint64_t loan_stride_ = 0;
     std::vector<int> loan_ring_n_;                                 ///< per device: the slots on the prefetch ring (the rest: scratch regions)
+    std::vector<std::vector<char>> loan_cls_;                      ///< per device, per slot: 0 = dropped at any prompt window, 1 = survives short ones
+    bool loans_parked_ = false;
     int loan_per_win_ = 8;
     bool loan_h2d_ = false;
     std::vector<std::vector<uint8_t*>> loan_ptr_h_;

@@ -57,7 +57,8 @@ const bool kNoDenseAttn = std::getenv("STRATA_GLM5_NODENSEATTN") != nullptr;
 constexpr int kGemmMinT = 16;    // windows at least this wide take the tensor-core GEMM for the dense weights
 constexpr int kQkvFuseT = 64;    // windows up to this many rows take the KDA q | k | v projections as one product ([T][3 D] scratch)
 constexpr int kFabT = 16;
-constexpr int kShT = 64;         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
+constexpr int kShT = 64;
+static const int kLoanKeepT = std::getenv("STRATA_GLM5_LOAN_KEEP_T") ? std::atoi(std::getenv("STRATA_GLM5_LOAN_KEEP_T")) : 128;   // the scratch tails' loans survive prompt windows up to this many tokens (0: none)         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
 static const bool kQ8Fuse = !std::getenv("STRATA_GLM5_Q8_FUSE") || std::atoi(std::getenv("STRATA_GLM5_Q8_FUSE")) != 0;   // 0: the producers do not quantize (a separate quantize per Q8_0 product)
 static const bool kWaitFuse = !std::getenv("STRATA_GLM5_WAIT_FUSE") || std::atoi(std::getenv("STRATA_GLM5_WAIT_FUSE")) != 0;   // 0: the wait, mask and place as three launches
 static const bool kCombineFuse = !std::getenv("STRATA_GLM5_COMBINE_FUSE") || std::atoi(std::getenv("STRATA_GLM5_COMBINE_FUSE")) != 0;   // 0: the combine as its own launch
@@ -220,8 +221,9 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
         auto f = [&](uint64_t n) { return static_cast<float*>(alloc(n * 4, ordinal)); };
         // the prompt scratch a decode window (<= 8 rows) leaves idle is lent to the decode-time expert cache: a buffer
         // whole, or past the rows a decode window writes (16 rows' worth, at least 4 MB; the lender keeps that head)
+        // a tail region keeps kLoanKeepT rows' worth (at least 4 MB) for the windows up to that size: its loans survive them
         auto lend = [&](void* p, uint64_t bytes, uint64_t row_bytes) {
-            if (p && bytes) d.lend.push_back({static_cast<uint8_t*>(p), bytes, row_bytes ? std::max<uint64_t>(16 * row_bytes, 4u << 20) : 0});
+            if (p && bytes) d.lend.push_back({static_cast<uint8_t*>(p), bytes, row_bytes ? std::max<uint64_t>((uint64_t) std::max(16, kLoanKeepT) * row_bytes, 4u << 20) : 0});
         };
         d.R = f((uint64_t) TS * hp_.hc * E);
         d.x = f((uint64_t) TS * E); d.xn = f((uint64_t) T * E); d.y = f((uint64_t) T * E);
@@ -1601,7 +1603,7 @@ void Engine::set_experts(ExpertStore* store) {
     static const bool kLendScratch = !std::getenv("STRATA_GLM5_LOAN_SCRATCH") || std::atoi(std::getenv("STRATA_GLM5_LOAN_SCRATCH")) != 0;   // 0: the ring's slots only
     if (store->loans_on() && kLendScratch) {
         for (auto& d : devs_)
-            for (const Dev::Lend& r : d.lend) store->add_loan_region(d.ordinal, r.base, r.bytes, r.skip);
+            for (const Dev::Lend& r : d.lend) store->add_loan_region(d.ordinal, r.base, r.bytes, r.skip, r.skip ? 1 : 0);
         store->finalize_loans();
     }
 }
@@ -1689,10 +1691,12 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
               d.bounds_res, d.bounds_miss, d.stream, mid_split_ ? 1 << 20 : 64, d.pair_rank);
     if (kDebugSync) debug_sync(d.stream, il, "group");
     // the activations of every pair, quantized for MMQ (row p = token pair_tok[p]); the stale rows past cnt[2] are harmless
+    // (the Q2_K rows stop at the window's pairs: the codes buffer's tail past kLoanKeepT tokens' worth holds parked loans)
+    const int n_pairs = std::min(max_pairs_, T * K);
     const bool q2k = d.q2k_codes && L.exp_gate.type == 10 && L.exp_up.type == 10 && L.exp_down.type == 10 && (2 * FF) % 128 == 0 && E % 256 == 0 && FF % 256 == 0;
     static bool noted = false;
     if (!noted) { noted = true; std::fprintf(stderr, "glm5: prompt experts: layer %d %s (types %u/%u/%u)\n", il, q2k ? "Q2_K on WMMA" : "MMQ", L.exp_gate.type, L.exp_up.type, L.exp_down.type); }
-    if (q2k) { strata::glm5::q2k::quantize_act(xn, d.pair_tok, max_pairs_, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, max_pairs_, E, d.q2k_packed, d.stream); }
+    if (q2k) { strata::glm5::q2k::quantize_act(xn, d.pair_tok, n_pairs, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, n_pairs, E, d.q2k_packed, d.stream); }
     else mmq::quantize(xn, d.pair_tok, d.mmq_xq, (int) L.exp_gate.type, E, E, pairs_alloc_, d.stream);
     prof_mark(d, "router+group");
     // the non-resident experts arrive by the prefetch (its flag); the resident ones are read in place in the slot buffer
@@ -1738,7 +1742,7 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     prof_mark(d, "moe_hits");
     swiglu_clamp_gu(d.gu_out, d.ffn_h, d.cnt + 2, max_pairs_, FF, hp_.clamp_exp[(size_t) il], d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "swiglu");
-    if (q2k) { strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, max_pairs_, FF, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, max_pairs_, FF, d.q2k_packed, d.stream); }
+    if (q2k) { strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, n_pairs, FF, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, n_pairs, FF, d.q2k_packed, d.stream); }
     else mmq::quantize(d.ffn_h, nullptr, d.mmq_xq_h, (int) L.exp_down.type, FF, FF, pairs_alloc_, d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "quantize h");
     mmq::Product dn;
@@ -1864,7 +1868,8 @@ void Engine::forward_window_impl(const int32_t* tokens, int T, const DumpFn& dum
     static const int kMidMaxT = std::getenv("STRATA_GLM5_MID_MAX_T") ? std::atoi(std::getenv("STRATA_GLM5_MID_MAX_T")) : 640;
     mid_mode_ = prompt_mode_ && (T < kPrefetchAllMinT || (split_ok && T <= std::min({kDbXRows, t_chunk_, kMidMaxT})));
     mid_split_ = mid_mode_ && split_ok && T <= kDbXRows;
-    if (prompt_mode_ && experts_ && experts_->loans_on()) drop_loans();   // the ring is the prompt path's again
+    if (prompt_mode_ && experts_ && experts_->loans_on()) drop_loans(kLoanKeepT > 0 && T <= kLoanKeepT);   // the ring is the prompt path's again (the scratch tails' loans survive a short window)
+    if (!prompt_mode_ && experts_ && experts_->loans_parked()) experts_->unpark_loans();
     cpu_mode_ = doorbell_ && !prompt_mode_ && T <= 8 && cpu_misses_ && experts_->cpu_ready();
     if (!prompt_mode_ && kNoDoorbell) doorbell_ = false;
     if (prompt_mode_) ring_parity_ ^= 1;
@@ -2068,9 +2073,9 @@ void Engine::stage_main(size_t di) {
     }
 }
 
-void Engine::drop_loans() {
+void Engine::drop_loans(bool keep_scratch) {
     for (auto& dd : devs_) { check(cudaSetDevice(dd.ordinal), "cudaSetDevice"); check(cudaStreamSynchronize(S(dd.stream)), "loan drop sync"); }
-    experts_->reset_loans();
+    experts_->reset_loans(keep_scratch);
 }
 
 void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, const std::function<void(int, int, bool)>& on_window) {
@@ -2093,7 +2098,7 @@ void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, c
     }
     // every window a prompt window on the ring; the stages run them as a pipeline
     if (db_failed_.load(std::memory_order_acquire)) throw std::runtime_error(db_err_);
-    if (experts_ && experts_->loans_on()) drop_loans();
+    if (experts_ && experts_->loans_on()) drop_loans(kLoanKeepT > 0 && n <= kLoanKeepT);   // (a short prompt keeps the scratch tails' loans parked)
     rows_mode_ = false; swaps_now_ = 0; doorbell_ = true; prompt_mode_ = true; mid_mode_ = false; mid_split_ = false; cpu_mode_ = false;
     db_active_.store(false, std::memory_order_release);
     std::vector<std::unique_ptr<Job>> jobs;

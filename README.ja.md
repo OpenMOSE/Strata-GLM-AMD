@@ -226,6 +226,9 @@ MoE と doorbell）、エキスパート階層と各方式の計測、MTP ドラ
 
 ## 更新内容
 
+- **2026-10-14 (後)** - 小さな改善の第 7 回: decode 時の expert キャッシュが短い prompt 窓 (サーバの次の発話) を生き延びる。
+  prompt が触らないバッファの尾に駐車し、prompt は駐車中の expert を PCIe でなくカード内からコピー。続く 7 ターンで decode 2.5%、
+  prefill 5% 速く ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。
 - **2026-10-13 (夜)** - 小さな改善の第 5 回: decode 時の expert キャッシュを素の経路 (CPU 供給 off) でも: そのモードの decode 61.8 → 44.5
   ms/token、slots-test の solo 82.8 → 64.3 ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。
 - **2026-10-13 (夕方)** - 小さな改善の第 4 回: 正確な融合をさらに 3 つ (swiglu + 量子化、combine を mHC の post-mix に、待ちと配置)、

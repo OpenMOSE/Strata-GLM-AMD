@@ -1141,3 +1141,29 @@ Where the host could be the round's limit, measured rather than assumed:
 - **The server.** A streaming client sees the engine's own rate (36.4 and 41.8 tok/s against the engine's 36.4 and
   41.8) and the first chunk 25 ms after the engine's prompt time: the Python layer adds nothing measurable. Tokens
   arrive in bursts of a speculative round (median gap 0, p90 ~70 ms).
+
+## Small gains, pass 7: loans that survive short prompts (2026-10-14)
+
+A server's turns alternate short prompt windows (the user's next message) with decode. Every prompt window dropped
+every loan, so each turn's decode started cold and re-staged its misses. Now the loan slots carved from the tails of
+the pair, projection and attention buffers (past 128 tokens' worth each, 548 slots of the 1514) are *parked* through a
+prompt window of up to 128 tokens (`STRATA_GLM5_LOAN_KEEP_T`, 0 = drop as before): `reset_loans(keep)` lands the
+pending copies, frees the ring's and the whole-buffer regions' loans, writes the device tables back to the resident
+slots (the prompt's grouping knows no loans), and keeps the survivors' slots and `loan_of`; `unpark_loans()` before
+the next decode window writes the tables with the parked entries again. A prompt window that routes to a parked
+expert copies its blob from the parked slot on the device instead of over PCIe (`STRATA_GLM5_PARK_SRC=0` restores the
+bus copy). 8 prompts of 33-77 tokens, 120 tokens each (the CPU-served mode), prompts 2-8 against the loans dropped:
+
+| | loans parked | loans dropped |
+|---|---|---|
+| decode, 7 x 120 tokens | 33.05 s | 33.89 s |
+| prefill, 7 prompts | 5.26 s | 5.52 s |
+| experts from VRAM | 73.9% | 72.7% |
+
+The bug it took three days to find: the prompt path's Q2_K activation quantizer wrote the codes of every one of the
+32,768 pair rows (the window's pairs and the stale rest), so it overwrote the loans parked in that buffer's tail - the
+parked copy a later window read was the prompt's codes, and the routing went out of range a few layers on. The
+quantizer now writes the window's pairs only (the WMMA product clamps its activation columns to the group, so no pad
+row is read). `STRATA_GLM5_PARK_CHECK=1` compares every parked slot against its host blob before it is unparked and
+prints the slot regions (a debugging aid). The slots-test (two conversations, batch rows) is exact: 0 mismatches,
+solo 63.1 ms/token (65.6 before), the batch rows 70.8 / 168.5 ms per window (74.3 / 186.5).

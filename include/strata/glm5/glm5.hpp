@@ -165,7 +165,7 @@ public:
     /// logits() and h_win() are the last window's.  Falls back to serial windows when the pipeline cannot run.
     void prompt_windows(int slot, const int32_t* tokens, int n, int wsize, const std::function<void(int, int, bool)>& on_window);
     bool pipeline_ready() const;
-    void drop_loans();
+    void drop_loans(bool keep_scratch = false);
     void release_waits();   ///< after a doorbell failure: the parked device waits opened so the host can throw   ///< before a prompt window: the decode loans in the prompt ring are dropped (the devices synced first)
     int solo_slot() const { return n_slots_; }
     ~Engine();

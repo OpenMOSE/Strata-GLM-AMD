@@ -542,6 +542,7 @@ void flag_kernel(int device, uint32_t* flag_dev, uint32_t tok, void* cs) {
 }
 // the loan copies by the shaders when the blob allows it (STRATA_GLM5_LOAN_MEMCPY=1: the copy engine, as before)
 const bool kLoanMemcpy = std::getenv("STRATA_GLM5_LOAN_MEMCPY") && std::atoi(std::getenv("STRATA_GLM5_LOAN_MEMCPY")) != 0;
+const bool kParkSrc = !std::getenv("STRATA_GLM5_PARK_SRC") || std::atoi(std::getenv("STRATA_GLM5_PARK_SRC")) != 0;   // 0: a parked loan is kept but not the prompt's copy source (bisecting)
 void copy_dev_kernel(int device, void* dst, const void* src, size_t bytes, void* ls) {
     int cur = 0;
     cudaGetDevice(&cur);
@@ -910,7 +911,8 @@ void ExpertStore::init_loans(int n_layers) {
         total += n;
     }
     loan_ring_n_.assign(devices_.size(), 0);
-    for (size_t d = 0; d < devices_.size(); ++d) loan_ring_n_[d] = (int) loan_ptr_h_[d].size();
+    loan_cls_.assign(devices_.size(), {});
+    for (size_t d = 0; d < devices_.size(); ++d) { loan_ring_n_[d] = (int) loan_ptr_h_[d].size(); loan_cls_[d].assign(loan_ptr_h_[d].size(), 0); }
     finalize_loans();
     loan_apply_n_.assign((size_t) n_layers, 0); loan_apply_side_.assign((size_t) n_layers, 0);
     for (int side = 0; side < 2; ++side) loan_apply_dev_[side].assign((size_t) n_layers, nullptr);
@@ -940,7 +942,7 @@ void ExpertStore::init_loans(int n_layers) {
                  total, loan_stride_ / 1e6, loan_per_win_, loan_h2d_ ? "CPU-served misses copied too" : "PCIe-staged misses only");
 }
 
-void ExpertStore::add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip) {
+void ExpertStore::add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip, int cls) {
     if (!loan_on_ || !base) return;
     size_t di = devices_.size();
     for (size_t d = 0; d < devices_.size(); ++d) if (devices_[d] == device_ordinal) di = d;
@@ -950,6 +952,7 @@ void ExpertStore::add_loan_region(int device_ordinal, uint8_t* base, size_t byte
         loan_holder_[di].push_back({-1, -1});
         loan_last_used_[di].push_back(0u);
         loan_busy_[di].push_back(0);
+        loan_cls_[di].push_back((char) cls);
         loan_free_[di].insert(loan_free_[di].begin(), (int) loan_ptr_h_[di].size() - 1);   // (the ring's slots are taken first)
     }
 }
@@ -976,7 +979,19 @@ void ExpertStore::finalize_loans() {
         ring += loan_ring_n_.empty() ? n : loan_ring_n_[d];
         extra += n - (loan_ring_n_.empty() ? n : loan_ring_n_[d]);
     }
-    if (extra) std::fprintf(stderr, "glm5 experts: loan pool: %d slots on the prefetch ring + %d in the prompt scratch (%.2f GB more)\n", ring, extra, extra * (double) loan_stride_ / 1e9);
+    int kept = 0;
+    for (size_t d = 0; d < devices_.size(); ++d) for (char c : loan_cls_[d]) kept += c == 1;
+    if (extra) std::fprintf(stderr, "glm5 experts: loan pool: %d slots on the prefetch ring + %d in the prompt scratch (%.2f GB more; %d of them survive prompt windows up to 128 tokens)\n", ring, extra, extra * (double) loan_stride_ / 1e9, kept);
+    if (std::getenv("STRATA_GLM5_PARK_CHECK"))
+        for (size_t d = 0; d < devices_.size(); ++d) {
+            int j0 = 0;
+            while (j0 < (int) loan_ptr_h_[d].size()) {   // runs of consecutive slots (one region each)
+                int j1 = j0;
+                while (j1 + 1 < (int) loan_ptr_h_[d].size() && loan_ptr_h_[d][(size_t) j1 + 1] == loan_ptr_h_[d][(size_t) j1] + loan_stride_ && loan_cls_[d][(size_t) j1 + 1] == loan_cls_[d][(size_t) j0]) ++j1;
+                std::fprintf(stderr, "glm5 loan region: device %zu slots %d..%d class %d at %p\n", d, j0, j1, (int) loan_cls_[d][(size_t) j0], (void*) loan_ptr_h_[d][(size_t) j0]);
+                j0 = j1 + 1;
+            }
+        }
 }
 
 int ExpertStore::loan_alloc(size_t di, int il, int e, uint32_t tok) {
@@ -1060,10 +1075,10 @@ void ExpertStore::apply_loans(int il, void* stream) {
     strata::glm5::loan_apply(src_dev, n, layers_[(size_t) il].slot_of_dev, stream);   // reads the mapped entries
 }
 
-void ExpertStore::reset_loans() {
+void ExpertStore::reset_loans(bool keep_scratch) {
     if (!loan_on_) return;
     std::lock_guard<std::mutex> lk(loan_m_);
-    bool any_loan = false;
+    bool any_loan = loans_parked_;
     for (size_t d = 0; d < devices_.size() && !any_loan; ++d) any_loan = loan_free_[d].size() != loan_holder_[d].size();
     for (size_t il = 0; il < layers_.size() && !any_loan; ++il) any_loan = loan_apply_n_[il] != 0 || !loan_batches_[il].empty();
     if (!any_loan) return;
@@ -1071,27 +1086,76 @@ void ExpertStore::reset_loans() {
         check(cudaSetDevice(devices_[d]), "cudaSetDevice");
         check(cudaStreamSynchronize(static_cast<cudaStream_t>(copy_streams_[d])), "loan reset sync");
         check(cudaStreamSynchronize(static_cast<cudaStream_t>(loan_streams_[d])), "loan reset sync");
+    }
+    // every copy has landed: the batches' additions are live (a survivor keeps its loan, a dropped one goes below)
+    for (size_t il = 0; il < layers_.size(); ++il) {
+        LayerExperts& E = layers_[il];
+        for (auto& b : loan_batches_[il]) {
+            for (const auto& [e, j] : b.adds) if (E.loan_of[(size_t) e] == j) E.loan_live[(size_t) e] = 1;
+            loan_event_done(b.di, b.ev);
+        }
+        loan_batches_[il].clear();
+        loan_apply_n_[il] = 0;   // (the device table is written from the mirror below: pending entries are moot)
+    }
+    bool survivors = false;
+    for (size_t d = 0; d < devices_.size(); ++d) {
         const int n = (int) loan_holder_[d].size();
-        loan_holder_[d].assign((size_t) n, {-1, -1}); loan_last_used_[d].assign((size_t) n, 0u); loan_busy_[d].assign((size_t) n, 0);
         loan_free_[d].clear();
-        for (int j = n - 1; j >= 0; --j) loan_free_[d].push_back(j);
+        for (int j = n - 1; j >= 0; --j) {
+            const bool keep = keep_scratch && loan_cls_[d][(size_t) j] == 1 && loan_holder_[d][(size_t) j].first >= 0;
+            if (keep) {   // parked: the slot and its expert's loan_of stay, but not live - every host path treats it as a miss, as the device does
+                const auto [hl, he] = loan_holder_[d][(size_t) j];
+                layers_[(size_t) hl].loan_live[(size_t) he] = 0;
+                survivors = true; loan_busy_[d][(size_t) j] = 0;
+                continue;
+            }
+            const auto [hl, he] = loan_holder_[d][(size_t) j];
+            if (hl >= 0) { layers_[(size_t) hl].loan_of[(size_t) he] = -1; layers_[(size_t) hl].loan_live[(size_t) he] = 0; layers_[(size_t) hl].loan_hits_n[(size_t) he] = 0; }
+            loan_holder_[d][(size_t) j] = {-1, -1}; loan_last_used_[d][(size_t) j] = 0u; loan_busy_[d][(size_t) j] = 0;
+            loan_free_[d].push_back(j);
+        }
         loan_clock_[d] = 0;
     }
     for (size_t il = 0; il < layers_.size(); ++il) {
         LayerExperts& E = layers_[il];
         if (E.device < 0 || E.loan_of.empty()) continue;
-        bool any = loan_apply_n_[il] > 0;   // entries not yet applied (a promotion's, an eviction's): the table from the host mirror
-        for (auto& v : E.loan_of) if (v >= 0) { v = -1; any = true; }
-        for (auto& v : E.loan_live) v = 0;
-        for (auto& v : E.loan_hits_n) v = 0;
-        loan_apply_n_[il] = 0;
-        for (auto& b : loan_batches_[il]) loan_event_done(b.di, b.ev);
-        loan_batches_[il].clear();
-        if (any) {   // the device table back to the resident slots (the host mirror of slot_of is current)
-            check(cudaSetDevice(E.device), "cudaSetDevice");
-            check(cudaMemcpy(E.slot_of_dev, E.slot_of.data(), E.slot_of.size() * 4, cudaMemcpyHostToDevice), "loan reset table");
-        }
+        for (size_t e = 0; e < E.loan_of.size(); ++e) { E.loan_live[e] = 0; if (E.loan_of[e] < 0) E.loan_hits_n[e] = 0; }   // (a survivor: parked, not live)
+        // the device table back to the resident slots: a prompt window's grouping knows no loans (survivors are parked)
+        check(cudaSetDevice(E.device), "cudaSetDevice");
+        check(cudaMemcpy(E.slot_of_dev, E.slot_of.data(), E.slot_of.size() * 4, cudaMemcpyHostToDevice), "loan reset table");
     }
+    loans_parked_ = survivors;
+}
+
+// the parked loans into the device tables (the mirror with the live loans' entries), before a decode window's grouping
+void ExpertStore::unpark_loans() {
+    if (!loan_on_ || !loans_parked_) return;
+    std::lock_guard<std::mutex> lk(loan_m_);
+    std::vector<int32_t> tab;
+    for (size_t il = 0; il < layers_.size(); ++il) {
+        LayerExperts& E = layers_[il];
+        if (E.device < 0 || E.loan_of.empty()) continue;
+        bool any = false;
+        tab = E.slot_of;
+        static const bool kCheck = std::getenv("STRATA_GLM5_PARK_CHECK") && std::atoi(std::getenv("STRATA_GLM5_PARK_CHECK")) != 0;
+        for (size_t e = 0; e < tab.size(); ++e) if (E.loan_of[e] >= 0) {
+            if (kCheck && E.host_pinned[e] && E.host_gate[e]) {   // the parked copy against the expert's host blob (a debugging aid)
+                const size_t di = (size_t) device_index_of_layer((int) il);
+                const int j = E.loan_of[e];
+                std::vector<uint8_t> head(4096), tail(4096);
+                check(cudaSetDevice(E.device), "cudaSetDevice");
+                cudaMemcpy(head.data(), loan_ptr_h_[di][(size_t) j], head.size(), cudaMemcpyDeviceToHost);
+                cudaMemcpy(tail.data(), loan_ptr_h_[di][(size_t) j] + E.blob - tail.size(), tail.size(), cudaMemcpyDeviceToHost);
+                const bool ok_h = std::memcmp(head.data(), E.host_gate[e], head.size()) == 0, ok_t = std::memcmp(tail.data(), E.host_gate[e] + E.blob - tail.size(), tail.size()) == 0;
+                if (!ok_h || !ok_t) std::fprintf(stderr, "glm5 park check: layer %zu expert %zu slot %d (class %d, ptr %p): head %s tail %s\n", il, e, j, (int) loan_cls_[di][(size_t) j], (void*) loan_ptr_h_[di][(size_t) j], ok_h ? "ok" : "DIFFERS", ok_t ? "ok" : "DIFFERS");
+            }
+            tab[e] = (1 << 30) | E.loan_of[e]; E.loan_live[e] = 1; any = true;   // (1 << 30: kernels.cu's kLoanBit); live again
+        }
+        if (!any) continue;
+        check(cudaSetDevice(E.device), "cudaSetDevice");
+        check(cudaMemcpy(E.slot_of_dev, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice), "loan unpark table");
+    }
+    loans_parked_ = false;
 }
 
 int ExpertStore::cpu_run(int il, const std::vector<Miss>& misses, int T, const float* x_rows, float* y_dev, int n_embd, uint32_t tok, uint32_t* h_flag2,
@@ -1249,8 +1313,13 @@ int ExpertStore::serve_mid(int il, const int32_t* ids, int n, int T, const float
     for (size_t i = 0; i < miss_e.size(); ++i) {
         if (on_cpu[i]) continue;
         const int e = miss_e[i];
+        if (loan_on_ && kParkSrc && E.loan_of[(size_t) e] >= 0) {   // a parked loan (not live in this window): its copy from the device, not the bus
+            copy_dev_kernel(E.device, ring_dst + (uint64_t) rank[(size_t) e] * stride, loan_ptr_h_[di][(size_t) E.loan_of[(size_t) e]], E.blob, cs);
+            ++loan_hits_;
+        } else {
         if (!E.host_pinned[(size_t) e]) throw std::runtime_error("serve_mid: an unpinned expert (the pin limit)");
         check(cudaMemcpyAsync(ring_dst + (uint64_t) rank[(size_t) e] * stride, E.host_gate[(size_t) e], E.blob, cudaMemcpyHostToDevice, cs), "ring dma");
+        }
         ++n_dma;
     }
     prefetched_ += (uint64_t) n_dma;
@@ -1471,8 +1540,13 @@ int ExpertStore::serve_ring(int il, const int32_t* ids, int n, uint32_t tok, uin
     if (missed.empty()) { __atomic_store_n(h_flag, tok, __ATOMIC_RELEASE); return 0; }
     if (wait_event) check(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(wait_event), 0), "ring wait");
     for (int e : missed) {
+        if (loan_on_ && kParkSrc && E.loan_of[(size_t) e] >= 0) {   // a parked loan (not live in this window): its copy from the device, not the bus
+            copy_dev_kernel(E.device, dst + (uint64_t) rank[(size_t) e] * stride, loan_ptr_h_[di][(size_t) E.loan_of[(size_t) e]], E.blob, cs);
+            ++loan_hits_;
+        } else {
         if (!E.host_pinned[(size_t) e]) throw std::runtime_error("serve_ring: an unpinned expert (the pin limit)");
         check(cudaMemcpyAsync(dst + (uint64_t) rank[(size_t) e] * stride, E.host_gate[(size_t) e], E.blob, cudaMemcpyHostToDevice, cs), "ring dma");
+        }
     }
     prefetched_ += (uint64_t) missed.size();
     if (flag_dev) flag_kernel(E.device, flag_dev, tok, cs);
