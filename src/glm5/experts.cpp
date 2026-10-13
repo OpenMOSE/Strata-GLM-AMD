@@ -681,7 +681,8 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
     cudaStream_t cs = static_cast<cudaStream_t>(copy_streams_[di]);
     std::vector<std::function<void()>> jobs;
     std::vector<int> missed;   // distinct missed experts, first-occurrence order = the device's miss index
-    int swapped = 0, n_promoted = 0;
+    std::vector<int> promo;    // loan hits past the promotion threshold: promoted after the classification (see below)
+    int swapped = 0;
     for (int j = 0; j < n; ++j) {
         const int e = ids[j];
         if (e < 0 || e >= (int) E.slot_of.size())
@@ -695,9 +696,8 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
                 seen_[(size_t) e] = 2;
                 uint8_t& hn = E.loan_hits_n[(size_t) e];
                 if (hn < 255) ++hn;
-                const bool want = promote_hits_ > 0 && hn >= promote_hits_ && n_promoted < promote_max_;
-                if (want && promote_loan(E, il, di, e, tok, max_swaps, swapped, cs)) ++n_promoted;
-                else loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+                loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+                if (promote_hits_ > 0 && hn >= promote_hits_ && (int) promo.size() < promote_max_) promo.push_back(e);
             }
             continue;
         }
@@ -708,6 +708,9 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
     }
     for (int e : missed) seen_[(size_t) e] = 0;
     for (int j = 0; j < n; ++j) seen_[(size_t) ids[j]] = 0;   // (the loan hits' marks too)
+    // the promotions after the whole window is classified: every hit's slot is marked used (no victim among them), and
+    // the evicted expert's change of state cannot cross this window's host / device numbering
+    for (int e : promo) promote_loan(E, il, di, e, tok, max_swaps, swapped, cs);
     std::sort(missed.begin(), missed.end());   // k_moe_group numbers the staging slots in ascending expert id
     if ((int) missed.size() > k_max_) throw std::runtime_error("serve: " + std::to_string(missed.size()) + " distinct misses, staging holds " + std::to_string(k_max_));
     distinct_misses_ += missed.size();
@@ -1253,8 +1256,9 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     // inside a group the pairs in token order
     std::vector<int> count((size_t) ne, 0);
     auto resident = [&](int e) { return E.slot_of[(size_t) e] >= 0 || (loan_on_ && E.loan_live[(size_t) e]); };   // live = in the device's table too
-    std::vector<char> promoted((size_t) ne, 0);   // a loan hit's promotion tried once per window
-    int n_promoted = 0, n_promo_calls = 0;
+    std::vector<char> promoted((size_t) ne, 0);   // a loan hit counted once per window
+    std::vector<int> promo;                       // loan hits past the promotion threshold: promoted after the classification
+    int n_promoted = 0;
     for (int j = 0; j < n; ++j) {
         const int e = ids[j];
         if (e < 0 || e >= ne) {   // a routing id outside the experts: the router saw NaN / garbage activations
@@ -1270,9 +1274,8 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
                     promoted[(size_t) e] = 1;
                     uint8_t& hn = E.loan_hits_n[(size_t) e];
                     if (hn < 255) ++hn;
-                    const bool want = promote_hits_ > 0 && hn >= promote_hits_ && n_promo_calls < promote_max_;
-                    if (want && promote_loan(E, il, di, e, tok, max_swaps, n_promoted, cs)) ++n_promo_calls;
-                    else loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+                    loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+                    if (promote_hits_ > 0 && hn >= promote_hits_ && (int) promo.size() < promote_max_) promo.push_back(e);
                 }
             }
         } else ++misses_;
@@ -1284,6 +1287,7 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     std::vector<int> col0((size_t) ne, -1);
     for (int e = 0; e < ne; ++e) if (count[(size_t) e] && !resident(e)) { col0[(size_t) e] = col; col += count[(size_t) e]; miss_e.push_back(e); }
     const int n_pairs = col, n_miss_rows = col - first_miss_row;
+    for (int e : promo) promote_loan(E, il, di, e, tok, max_swaps, n_promoted, cs);   // (after the classification: see serve())
     distinct_misses_ += miss_e.size();
     if (!miss_e.empty()) ++layers_missed_;
     for (int e : miss_e) if (E.evicted_once[(size_t) e]) ++thrash_;

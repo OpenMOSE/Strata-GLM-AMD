@@ -1108,8 +1108,14 @@ solo 82.8 -> 64.3 ms/token, two slots at 1 token per window 72.2 -> 53.2 ms/toke
 swaps it into residency, and the next prompt window drops the loans.
 
 A promotion was tried for that (a loan hit inside the admission window swapped into a resident slot from its loan copy):
-unlimited it thrashed (2,800 swaps per 200 tokens, 94 ms per round); gated by hit count it still left the device's table
-inconsistent across a prompt window in one path (a routing id of 2^31 - 1 in the second conversation of the slots-test).
-It stays in the code switched off (`STRATA_GLM5_PROMOTE_HITS`, default 0) until that is found. Also in this pass: a
-column-tile switch for the prompt WMMA kernel (`STRATA_GLM5_Q2K_NT`, 2 / 3 / 4), loan, promotion and copy counters on
-the CLI's last line.
+unlimited it thrashed (2,800 swaps per 200 tokens, 94 ms per round); done inside the classification loop it corrupted
+the next window (a routing id of 2^31 - 1: the host's view of the evicted expert changed while the device had already
+numbered the window). Promoting after the classification (the hits' slots all marked, the evicted expert's change
+invisible to this window) is exact and lifts the batch rows (73.8 -> 65.8 ms per window, hits 92%), but in the CPU-served
+mode each promotion's save of the victim to the host competes for the memory bus the CPU service lives on: 79.8 against
+69.1 ms per round on the 200-token test, +3% on a two-turn run. It stays switched off (`STRATA_GLM5_PROMOTE_HITS`, default
+0; `_MAX` per layer-window). Also in this pass: a
+column-tile switch for the prompt WMMA kernel (`STRATA_GLM5_Q2K_NT`, 2 / 3 / 4: wider tiles amortize the weight
+dequantization over more columns, but the 4K window measured 5.14 / 5.25 / 5.70 s - 2 stays), loan, promotion and copy
+counters on the CLI's last line. The 4K window's phases now: the expert products 37%, the KDA q | k | v products 12%, the
+DSA attention 10%, the KDA scan 9%, mHC 8%.
