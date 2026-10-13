@@ -371,6 +371,7 @@ public:
         int32_t* cpu_skip_d = nullptr;
         int32_t* ids_host = nullptr;
         int* sel_params_host = nullptr;
+        std::vector<int> sel_shadow, sel2_shadow, row_shadow;   ///< the contents last uploaded to sel_params / sel_params2 / row_slot+pos (an equal upload is skipped)
         float* bounce = nullptr;
         // the MoE doorbell: host-mapped pinned records (one per layer) and their device views
         int32_t* db_ids_h = nullptr;      ///< n_layer x T x k

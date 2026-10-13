@@ -226,6 +226,9 @@ MoE と doorbell）、エキスパート階層と各方式の計測、MTP ドラ
 
 ## 更新内容
 
+- **2026-10-14 (夜)** - 小さな改善の第 8 回: Q2_K 活性量子化器からバイト書き込みを排除 (5 倍速)、gate と up を 1 起動に、
+  ストライド縮約のロードを先出し、LoD の表は窓ごとに 1 回だけ転送、貸出は 256 トークンまでの prompt を生き延びる。すべて
+  ビット一致 ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。
 - **2026-10-14 (後)** - 小さな改善の第 7 回: decode 時の expert キャッシュが短い prompt 窓 (サーバの次の発話) を生き延びる。
   prompt が触らないバッファの尾に駐車し、prompt は駐車中の expert を PCIe でなくカード内からコピー。続く 7 ターンで decode 2.5%、
   prefill 5% 速く ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。

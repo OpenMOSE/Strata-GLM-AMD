@@ -1024,7 +1024,8 @@ __global__ void k_f32_gemv_t(const float* __restrict__ W, const float* __restric
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
     if ((n_in & 3) == 0) {
         const float4* w4 = reinterpret_cast<const float4*>(w);
-        for (int i = lane; i < n_in / 4; i += WARP) {
+#pragma unroll 4
+        for (int i = lane; i < n_in / 4; i += WARP) {   // (unrolled: four rows' loads in flight per lane; the FMA order per lane unchanged)
             const float4 a = w4[i];
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
@@ -1033,6 +1034,7 @@ __global__ void k_f32_gemv_t(const float* __restrict__ W, const float* __restric
             }
         }
     } else {
+#pragma unroll 4
         for (int i = lane; i < n_in; i += WARP) {
             const float a = w[i];
 #pragma unroll
@@ -1225,6 +1227,7 @@ __global__ void k_mhc_post_t(const float* __restrict__ y, const float* __restric
 // The decode chain's tail in one launch (block per token, 256 threads): the residual scale rs, the mix sums (the parts
 // unscaled, rs applied to the sums), the nonlinearity (k_mhc_nonlin_t's warp code), then x = pre-mixed R and its RMS norm
 // (k_mhc_pre_apply_t + k_rms_norm).  Replaces rs + nonlin + pre_apply + rms_norm (four launches) for T <= 8.
+template <int HC>   // HC: the stream count when known at compile time (the pre-mix's R values ride in registers), 0 = runtime
 __global__ void k_mhc_finish_t(const float* __restrict__ R, const float* __restrict__ part, const float* __restrict__ scale,
                                const float* __restrict__ base, float* __restrict__ mixes, float* __restrict__ pre, float* __restrict__ post,
                                float* __restrict__ comb, const float* __restrict__ norm_w, float* __restrict__ x, float* __restrict__ xn,
@@ -1248,13 +1251,25 @@ __global__ void k_mhc_finish_t(const float* __restrict__ R, const float* __restr
         mt[lane] = m;
     }
     __syncthreads();
-    if (lane < WARP) {
-        if (lane < hc) {
-            const float pv = sigmoidf_(mt[lane] * scale[0] + base[lane]) + eps_hc;
-            pre[t * hc + lane] = pv;
-            pre_s[lane] = pv;
-            post[t * hc + lane] = 2.0f * sigmoidf_(mt[hc + lane] * scale[1] + base[hc + lane]);
+    if (lane < hc) {   // (the first warp)
+        const float pv = sigmoidf_(mt[lane] * scale[0] + base[lane]) + eps_hc;
+        pre[t * hc + lane] = pv;
+        pre_s[lane] = pv;
+        post[t * hc + lane] = 2.0f * sigmoidf_(mt[hc + lane] * scale[1] + base[hc + lane]);
+    }
+    __syncthreads();
+    // the pre-mix's R values loaded now: in flight while the first warp runs the Sinkhorn iterations below
+    constexpr int kH = HC > 0 ? HC : 1;
+    float rv[kMaxPer][kH];
+    if (HC > 0) {
+        int k = 0;
+#pragma unroll
+        for (int i = threadIdx.x; i < n_embd && k < kMaxPer; i += blockDim.x, ++k) {
+#pragma unroll
+            for (int h = 0; h < kH; ++h) rv[k][h] = Rt[(size_t) h * n_embd + i];
         }
+    }
+    if (lane < WARP) {
         const bool on = lane < hc * hc;
         float c = on ? mt[2 * hc + lane] * scale[2] + base[2 * hc + lane] : -INFINITY;
         float m = c;
@@ -1281,14 +1296,18 @@ __global__ void k_mhc_finish_t(const float* __restrict__ R, const float* __restr
         for (int it = 1; it < iters; ++it) { norm_rows(); norm_cols(); }
         if (on) comb[t * hc * hc + lane] = c;
     }
-    __syncthreads();
     float xv[kMaxPer];
     float s2 = 0.f;
     int k = 0;
 #pragma unroll
     for (int i = threadIdx.x; i < n_embd && k < kMaxPer; i += blockDim.x, ++k) {
         float acc = 0.f;
-        for (int h = 0; h < hc; ++h) acc += Rt[(size_t) h * n_embd + i] * pre_s[h];
+        if (HC > 0) {
+#pragma unroll
+            for (int h = 0; h < kH; ++h) acc += rv[k][h] * pre_s[h];   // (the same order of additions as the runtime loop)
+        } else {
+            for (int h = 0; h < hc; ++h) acc += Rt[(size_t) h * n_embd + i] * pre_s[h];
+        }
         x[(size_t) t * n_embd + i] = acc;
         xv[k] = acc;
         s2 += acc * acc;
@@ -1570,7 +1589,8 @@ __global__ void k_dsa_absorb_t(const uint16_t* __restrict__ wk_b, const float* _
     float acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
-    for (int i = lane; i < head_k; i += WARP) {
+#pragma unroll 4
+    for (int i = lane; i < head_k; i += WARP) {   // (unrolled: the loads in flight; the per-lane order unchanged)
         const float wv = bf16f(w[i]);
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[t] += wv * q[((size_t) t * n_head + h) * head_k + i];
@@ -1592,7 +1612,8 @@ __global__ void k_dsa_expand_t(const uint16_t* __restrict__ wv_b, const float* _
     float acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = 0.f;
-    for (int j = lane; j < kv_lora; j += WARP) {
+#pragma unroll 4
+    for (int j = lane; j < kv_lora; j += WARP) {   // (unrolled, as above)
         const float wv = bf16f(w[j]);
 #pragma unroll
         for (int t = 0; t < NT; ++t) acc[t] += wv * ctx[((size_t) t * n_head + h) * kv_lora + j];
@@ -2059,7 +2080,8 @@ void mhc_dec_t(const float* R, const float* fn, const float* scale, const float*
     default: k_mhc_mixes_t<8><<<g, 128, 0, S(s)>>>(R, fn, nullptr, part, n, n_mix); break;
     }
     if (n_embd % 1024 || n_embd > 8 * 1024 || (hc * n_embd) % 4) throw std::runtime_error("mhc_dec_t: n_embd must be a multiple of 1024 up to 8192");
-    k_mhc_finish_t<<<T, 1024, 0, S(s)>>>(R, part, scale, base, mixes, pre, post, comb, norm_w, x, xn, xn_q8, n_embd, hc, iters, eps_rms, eps_hc, kMixSlices);
+    if (hc == 4) k_mhc_finish_t<4><<<T, 1024, 0, S(s)>>>(R, part, scale, base, mixes, pre, post, comb, norm_w, x, xn, xn_q8, n_embd, hc, iters, eps_rms, eps_hc, kMixSlices);
+    else k_mhc_finish_t<0><<<T, 1024, 0, S(s)>>>(R, part, scale, base, mixes, pre, post, comb, norm_w, x, xn, xn_q8, n_embd, hc, iters, eps_rms, eps_hc, kMixSlices);
 }
 void kda_conv_silu_t(const float* x, int ldx, int n_seg, float* conv_state, int seg_stride, const float* w, Ptr3 out, float* snap, int snap_stride,
                      int d_inner, int d_conv, int T, void* s) {

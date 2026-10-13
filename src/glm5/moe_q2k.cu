@@ -26,37 +26,39 @@ constexpr int kRowsPerWave = 16, kWaves = 8, kThreads = 32 * kWaves, kRowTile = 
 __global__ void k_quant_act(const float* __restrict__ x, const int32_t* __restrict__ ids, int K, int8_t* __restrict__ codes,
                             float* __restrict__ scales, int32_t* __restrict__ sums, const int* __restrict__ row_lo, const int* __restrict__ row_hi,
                             int32_t* __restrict__ packed) {
-    __shared__ float red[8];
+    // 64 threads per super-block of 256: thread i holds the elements 4 i .. 4 i + 3 (a float4 in, a char4 out - byte stores
+    // cost five times the kernel); the block max and the 16-element integer sums are order-free, so the codes are the same
+    __shared__ float red[2];
     __shared__ int s16[16];
-    const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x;
+    const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x * 4;
     if ((row_lo && row < *row_lo) || (row_hi && row >= *row_hi)) return;
     const int src = ids ? ids[row] : row;
-    const float v = x[(size_t) src * K + k];
-    float am = fabsf(v);
+    const float4 v = *reinterpret_cast<const float4*>(x + (size_t) src * K + k);
+    float am = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor(am, o, 32));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
     __syncthreads();
-    am = red[0];
-    for (int w = 1; w < 8; ++w) am = fmaxf(am, red[w]);
+    am = fmaxf(red[0], red[1]);
     const float d = am / 127.f, inv = am > 0.f ? 127.f / am : 0.f;
-    const int q = __float2int_rn(v * inv);
-    codes[(size_t) row * K + k] = (int8_t) q;
-    int s = q;
-    for (int o = 8; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);   // the 16-lane sums (lanes 0..15 and 16..31 of a wave)
+    const int q0 = __float2int_rn(v.x * inv), q1 = __float2int_rn(v.y * inv), q2 = __float2int_rn(v.z * inv), q3 = __float2int_rn(v.w * inv);
+    char4 c; c.x = (int8_t) q0; c.y = (int8_t) q1; c.z = (int8_t) q2; c.w = (int8_t) q3;
+    *reinterpret_cast<char4*>(codes + (size_t) row * K + k) = c;
+    int s = q0 + q1 + q2 + q3;
+    s += __shfl_xor(s, 1, 32); s += __shfl_xor(s, 2, 32);   // the 16-element sums (four consecutive threads)
     if (threadIdx.x == 0) scales[(size_t) row * (K / 256) + blk] = d;
     if (!packed) {
-        if ((threadIdx.x & 15) == 0) sums[(size_t) row * (K / 16) + k / 16] = s;
+        if ((threadIdx.x & 3) == 0) sums[(size_t) row * (K / 16) + k / 16] = s;
         return;
     }
     // this super-block's 16 sums packed here (k_pack_sums' layout): thread i < 4 the low bytes of sums 4 i .. 4 i + 3, i >= 4 the high bytes
-    if ((threadIdx.x & 15) == 0) s16[threadIdx.x >> 4] = s;
+    if ((threadIdx.x & 3) == 0) s16[threadIdx.x >> 2] = s;
     __syncthreads();
     if (threadIdx.x < 8) {
         const int i = threadIdx.x;
-        uint32_t v = 0;
+        uint32_t pv = 0;
 #pragma unroll
-        for (int t = 0; t < 4; ++t) { const int xq = s16[4 * (i & 3) + t]; v |= (uint32_t) ((i < 4 ? xq : (xq >> 8)) & 0xff) << (8 * t); }
-        packed[((size_t) row * (K / 256) + blk) * 8 + i] = (int32_t) v;
+        for (int t = 0; t < 4; ++t) { const int xq = s16[4 * (i & 3) + t]; pv |= (uint32_t) ((i < 4 ? xq : (xq >> 8)) & 0xff) << (8 * t); }
+        packed[((size_t) row * (K / 256) + blk) * 8 + i] = (int32_t) pv;
     }
 }
 
@@ -302,11 +304,14 @@ __global__ void k_pack_sums(const int32_t* __restrict__ sums, int nsb, int32_t* 
     packed[((size_t) c * nsb + sb) * 8 + i] = (int32_t) v;
 }
 
-__global__ void __launch_bounds__(kThreads) k_dec_wmma(const void* const* __restrict__ wp, const int* __restrict__ col0, const int* __restrict__ ncols,
+__global__ void __launch_bounds__(kThreads) k_dec_wmma(const void* const* __restrict__ wp0, const int* __restrict__ col0, const int* __restrict__ ncols,
                                                         const int* __restrict__ orow, const int* __restrict__ g_begin, const int* __restrict__ g_end,
                                                         const int8_t* __restrict__ codes, const float* __restrict__ scales, const int32_t* __restrict__ packed,
-                                                        float* __restrict__ y, int K, int n_out) {
+                                                        float* __restrict__ y0, int K, int n_out, const void* const* __restrict__ wp1, float* __restrict__ y1) {
 #if STRATA_Q2K_WMMA
+    // blockIdx.z selects the product: 0 = (wp0, y0), 1 = (wp1, y1) - the gate and up products of a layer in one launch
+    const void* const* __restrict__ wp = blockIdx.z ? wp1 : wp0;
+    float* __restrict__ y = blockIdx.z ? y1 : y0;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, r = lane & 15, half = lane >> 4;
     const int nsb = K / 256, rowbytes = nsb * kSb;
     const int gb = *g_begin, ge = *g_end;
@@ -368,7 +373,7 @@ __global__ void __launch_bounds__(kThreads) k_dec_wmma(const void* const* __rest
         }
     }
 #else
-    (void) wp; (void) col0; (void) ncols; (void) orow; (void) g_begin; (void) g_end; (void) codes; (void) scales; (void) packed; (void) y; (void) K; (void) n_out;
+    (void) wp0; (void) wp1; (void) col0; (void) ncols; (void) orow; (void) g_begin; (void) g_end; (void) codes; (void) scales; (void) packed; (void) y0; (void) y1; (void) K; (void) n_out;
 #endif
 }
 }  // namespace
@@ -380,27 +385,31 @@ bool available() { return STRATA_Q2K_WMMA != 0 || true; }
 __global__ void k_swiglu_quant_act(const float* __restrict__ g, const float* __restrict__ u, const int* __restrict__ n_rows, int K, float limit,
                                    int8_t* __restrict__ codes, float* __restrict__ scales, int32_t* __restrict__ packed,
                                    const int* __restrict__ row_lo, const int* __restrict__ row_hi) {
-    __shared__ float red[8];
+    // (k_quant_act's layout: 64 threads x 4 elements per super-block)
+    __shared__ float red[2];
     __shared__ int s16[16];
-    const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x;
+    const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x * 4;
     if (row >= *n_rows || (row_lo && row < *row_lo) || (row_hi && row >= *row_hi)) return;
     const size_t o = (size_t) row * K + k;
-    const float gv = g[o], uv = u[o];
-    const float gc = limit > 0.f ? fminf(gv, limit) : gv;
-    const float v = limit > 0.f ? gc / (1.f + expf(-gc)) * fminf(fmaxf(uv, -limit), limit) : gc / (1.f + expf(-gc)) * uv;
-    float am = fabsf(v);
+    const float4 g4 = *reinterpret_cast<const float4*>(g + o), u4 = *reinterpret_cast<const float4*>(u + o);
+    auto act = [&](float gv, float uv) {
+        const float gc = limit > 0.f ? fminf(gv, limit) : gv;
+        return limit > 0.f ? gc / (1.f + expf(-gc)) * fminf(fmaxf(uv, -limit), limit) : gc / (1.f + expf(-gc)) * uv;
+    };
+    const float v0 = act(g4.x, u4.x), v1 = act(g4.y, u4.y), v2 = act(g4.z, u4.z), v3 = act(g4.w, u4.w);
+    float am = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
     for (int o2 = 16; o2 > 0; o2 >>= 1) am = fmaxf(am, __shfl_xor(am, o2, 32));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
     __syncthreads();
-    am = red[0];
-    for (int w = 1; w < 8; ++w) am = fmaxf(am, red[w]);
+    am = fmaxf(red[0], red[1]);
     const float d = am / 127.f, inv = am > 0.f ? 127.f / am : 0.f;
-    const int qv = __float2int_rn(v * inv);
-    codes[(size_t) row * K + k] = (int8_t) qv;
-    int sm = qv;
-    for (int o2 = 8; o2 > 0; o2 >>= 1) sm += __shfl_xor(sm, o2, 32);
+    const int q0 = __float2int_rn(v0 * inv), q1 = __float2int_rn(v1 * inv), q2 = __float2int_rn(v2 * inv), q3 = __float2int_rn(v3 * inv);
+    char4 c; c.x = (int8_t) q0; c.y = (int8_t) q1; c.z = (int8_t) q2; c.w = (int8_t) q3;
+    *reinterpret_cast<char4*>(codes + o) = c;
+    int sm = q0 + q1 + q2 + q3;
+    sm += __shfl_xor(sm, 1, 32); sm += __shfl_xor(sm, 2, 32);
     if (threadIdx.x == 0) scales[(size_t) row * (K / 256) + blk] = d;
-    if ((threadIdx.x & 15) == 0) s16[threadIdx.x >> 4] = sm;
+    if ((threadIdx.x & 3) == 0) s16[threadIdx.x >> 2] = sm;
     __syncthreads();
     if (threadIdx.x < 8) {
         const int i = threadIdx.x;
@@ -414,14 +423,14 @@ void swiglu_quantize(const float* g, const float* u, const int* n_rows, int rows
                      void* s, const int* row_lo, const int* row_hi) {
     if (K % 256) throw std::runtime_error("q2k: K must be a multiple of 256");
     if (rows_max <= 0) return;
-    k_swiglu_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows_max), 256, 0, S(s)>>>(g, u, n_rows, K, limit, codes, scales, packed, row_lo, row_hi);
+    k_swiglu_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows_max), 64, 0, S(s)>>>(g, u, n_rows, K, limit, codes, scales, packed, row_lo, row_hi);
 }
 
 void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* s, const int* row_lo,
                   const int* row_hi, int32_t* packed) {
     if (K % 256) throw std::runtime_error("q2k: K must be a multiple of 256");
     if (rows <= 0) return;
-    k_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows), 256, 0, S(s)>>>(x, ids, K, codes, scales, sums, row_lo, row_hi, packed);
+    k_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows), 64, 0, S(s)>>>(x, ids, K, codes, scales, sums, row_lo, row_hi, packed);
 }
 
 void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K, const int32_t* bounds, int n, int max_cols,
@@ -478,10 +487,11 @@ void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* s, c
 }
 
 void dec_wmma(const void* const* wp, const int* col0, const int* ncols, const int* orow, const int* g_begin, const int* g_end,
-              const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* s) {
+              const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* s,
+              const void* const* wp2, float* y2) {
     if (n_out <= 0) return;
     if (n_out % kRowTile) throw std::runtime_error("q2k dec: n_out must be a multiple of " + std::to_string(kRowTile));
-    const dim3 grid((unsigned) (n_out / kRowTile), 32u);
-    k_dec_wmma<<<grid, kThreads, 0, S(s)>>>(wp, col0, ncols, orow, g_begin, g_end, codes, scales, packed, y, K, n_out);
+    const dim3 grid((unsigned) (n_out / kRowTile), 32u, wp2 ? 2u : 1u);
+    k_dec_wmma<<<grid, kThreads, 0, S(s)>>>(wp, col0, ncols, orow, g_begin, g_end, codes, scales, packed, y, K, n_out, wp2 ? wp2 : wp, y2 ? y2 : y);
 }
 }  // namespace strata::glm5::q2k

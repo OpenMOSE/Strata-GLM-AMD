@@ -981,7 +981,7 @@ void ExpertStore::finalize_loans() {
     }
     int kept = 0;
     for (size_t d = 0; d < devices_.size(); ++d) for (char c : loan_cls_[d]) kept += c == 1;
-    if (extra) std::fprintf(stderr, "glm5 experts: loan pool: %d slots on the prefetch ring + %d in the prompt scratch (%.2f GB more; %d of them survive prompt windows up to 128 tokens)\n", ring, extra, extra * (double) loan_stride_ / 1e9, kept);
+    if (extra) std::fprintf(stderr, "glm5 experts: loan pool: %d slots on the prefetch ring + %d in the prompt scratch (%.2f GB more; %d of them survive short prompt windows)\n", ring, extra, extra * (double) loan_stride_ / 1e9, kept);
     if (std::getenv("STRATA_GLM5_PARK_CHECK"))
         for (size_t d = 0; d < devices_.size(); ++d) {
             int j0 = 0;

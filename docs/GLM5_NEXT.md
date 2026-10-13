@@ -1167,3 +1167,38 @@ quantizer now writes the window's pairs only (the WMMA product clamps its activa
 row is read). `STRATA_GLM5_PARK_CHECK=1` compares every parked slot against its host blob before it is unparked and
 prints the slot regions (a debugging aid). The slots-test (two conversations, batch rows) is exact: 0 mismatches,
 solo 63.1 ms/token (65.6 before), the batch rows 70.8 / 168.5 ms per window (74.3 / 186.5).
+
+## Small gains, pass 8: launch gaps and latency-bound kernels (2026-10-14)
+
+A kernel census of a decode round (rocprofv3, 59 rounds): 1,975 launches per round. HIP graphs do not help on this
+ROCm: 2,300 tiny launches cost 3.06 us each on a stream and 3.03 us from one graph (per-layer graphs 4.45 us), so
+the gaps shrink only by launching less. The round's time is the CPU-served wait (bus-bound, ~27 ms), the dense Q8_0
+products (12 ms, at the memory bandwidth), the Q2_K expert products (~11 ms) and a long tail of small kernels that
+are latency-bound rather than bandwidth-bound. The pass, all bit-identical (the deterministic check and the slots-test):
+
+- **Byte stores.** The Q2_K activation quantizer wrote one int8 per thread: 24 rows x 4096 took 15 us, five times
+  the launch floor, because sub-word stores are that slow here (the same kernel writing `char4` runs at the floor).
+  `k_quant_act` and the fused swiglu quantizer now hold four elements per thread (float4 in, char4 out); the block max
+  and the 16-element integer sums are order-free, so the codes are the same. The router+group phase 4.3 -> 3.0 ms
+  per round; the prompt windows use the same kernels.
+- **Loads in flight.** The strided reductions (a warp per weight row, the row read in 32 lane-strided steps) were
+  waiting on one load at a time: the F32 router GEMV 7.5 -> 4.9 us with `#pragma unroll 4` (the FMA order per lane
+  unchanged); the same on the MLA absorb / expand kernels.
+- **Gate and up in one launch.** The decode-window WMMA kernel takes a second (weights, output) pair selected by the
+  grid's z index: the resident experts' gate and up products are one launch (the 16-row tiles of both fill the
+  machine better than either alone): moe_hits 9.3 -> 8.5 ms per round.
+- **LoD parameter uploads.** Each DSA layer of a decode window re-sent the same per-token selection table (and the
+  row slot/position pairs) with 3-4 small host-to-device copies; a shadow of what the device holds skips an equal
+  upload (~50 copies per round gone; the dense path and the batch-rows window invalidate the shadow).
+- **mHC finish.** The per-token kernel loads the pre-mix's four stream rows into registers before the first warp runs
+  the 20 Sinkhorn iterations (the loads were issued after them).
+- **The park range.** Loans survive prompt windows up to 256 tokens now (was 128; `STRATA_GLM5_LOAN_KEEP_T`): on
+  eight follow-up prompts of 112-203 tokens the prefill is 3.5% and the decode 1.7% faster than with 128, for 14
+  fewer slots.
+- **The profile print** (`STRATA_GLM5_PROF=1`) shows hundredths of a millisecond per phase; averaged over a run's
+  windows it resolves 0.1 ms changes (the integer print could not).
+
+The slots-test's solo decode: 63.1 -> 62.0 ms/token after the quantizers (65.6 before pass 7), the batch rows 70.8 ->
+69.8 and 168.5 -> 166.2 ms per window. The eight-prompt turns (pass 7's test, the CPU-served mode): the decode of
+prompts 2-8 33.05 -> 31.07 s (6% faster), the prefill unchanged. Tried and left: the quantizer's 128-thread shape (the
+byte stores were the cost, not the block size).

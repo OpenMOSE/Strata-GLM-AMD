@@ -236,6 +236,9 @@ checked against is llama.cpp's `glm5-next`; `tools/glm_oracle/` dumps its interm
 
 ## What changed
 
+- **2026-10-14 (night)** - Small gains, pass 8: the Q2_K activation quantizer without byte stores (5x faster), gate and
+  up as one launch, the strided reductions with their loads in flight, the LoD tables uploaded once per window, loans
+  parked through prompts up to 256 tokens. All bit-identical ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md)).
 - **2026-10-14 (later)** - Small gains, pass 7: the decode-time expert cache survives short prompt windows (a server's
   next message), parked in the buffer tails the prompt does not touch; a prompt copies a parked expert from the card
   instead of over PCIe. Seven follow-up turns: decode 2.5% and prefill 5% faster ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md)).

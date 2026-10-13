@@ -38,6 +38,8 @@ void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* stre
 /// (as quantize_act + pack_sums of the swiglu rows would); the grid covers rows_max rows
 void swiglu_quantize(const float* g, const float* u, const int* n_rows, int rows_max, int K, float limit, int8_t* codes, float* scales, int32_t* packed,
                      void* stream, const int* row_lo = nullptr, const int* row_hi = nullptr);
+/// wp2 / y2: a second product over the same groups and activations (the up projection beside the gate) in the same launch
 void dec_wmma(const void* const* wp, const int* col0, const int* ncols, const int* orow, const int* g_begin, const int* g_end,
-              const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* stream);
+              const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* stream,
+              const void* const* wp2 = nullptr, float* y2 = nullptr);
 }  // namespace strata::glm5::q2k

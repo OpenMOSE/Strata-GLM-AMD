@@ -58,7 +58,7 @@ constexpr int kGemmMinT = 16;    // windows at least this wide take the tensor-c
 constexpr int kQkvFuseT = 64;    // windows up to this many rows take the KDA q | k | v projections as one product ([T][3 D] scratch)
 constexpr int kFabT = 16;
 constexpr int kShT = 64;
-static const int kLoanKeepT = std::getenv("STRATA_GLM5_LOAN_KEEP_T") ? std::atoi(std::getenv("STRATA_GLM5_LOAN_KEEP_T")) : 128;   // the scratch tails' loans survive prompt windows up to this many tokens (0: none)         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
+static const int kLoanKeepT = std::getenv("STRATA_GLM5_LOAN_KEEP_T") ? std::atoi(std::getenv("STRATA_GLM5_LOAN_KEEP_T")) : 256;   // the scratch tails' loans survive prompt windows up to this many tokens (0: none)         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
 static const bool kQ8Fuse = !std::getenv("STRATA_GLM5_Q8_FUSE") || std::atoi(std::getenv("STRATA_GLM5_Q8_FUSE")) != 0;   // 0: the producers do not quantize (a separate quantize per Q8_0 product)
 static const bool kWaitFuse = !std::getenv("STRATA_GLM5_WAIT_FUSE") || std::atoi(std::getenv("STRATA_GLM5_WAIT_FUSE")) != 0;   // 0: the wait, mask and place as three launches
 static const bool kCombineFuse = !std::getenv("STRATA_GLM5_COMBINE_FUSE") || std::atoi(std::getenv("STRATA_GLM5_COMBINE_FUSE")) != 0;   // 0: the combine as its own launch
@@ -505,6 +505,7 @@ void Engine::forward_rows(const int32_t* tokens, const int* slots, int n_rows) {
         check(cudaSetDevice(d.ordinal), "cudaSetDevice");
         for (int t = 0; t < n_rows; ++t) { d.row_slot_h[t] = row_slot_[(size_t) t]; d.row_pos_h[t] = row_pos_[(size_t) t]; d.row_k_h[t] = row_k_[(size_t) t]; }
         for (int g = 0; g < n_grp_; ++g) { d.grp_slot_h[g] = grp_slot_[(size_t) g]; d.grp_start_h[g] = grp_start_[(size_t) g]; d.grp_len_h[g] = grp_len_[(size_t) g]; }
+        d.row_shadow.clear();   // (the solo path's shadow of these tables no longer holds)
         check(cudaMemcpyAsync(d.row_slot_d, d.row_slot_h, (size_t) n_rows * 4, cudaMemcpyHostToDevice, S(d.stream)), "row slots");
         check(cudaMemcpyAsync(d.row_pos_d, d.row_pos_h, (size_t) n_rows * 4, cudaMemcpyHostToDevice, S(d.stream)), "row positions");
         check(cudaMemcpyAsync(d.row_k_d, d.row_k_h, (size_t) n_rows * 4, cudaMemcpyHostToDevice, S(d.stream)), "row k");
@@ -864,6 +865,14 @@ int Engine::lod_n_sel(int n_kv, int n_top) const {
 // exactly and every other complete page as one count-corrected summary (the page mean, logit + log ps).  Decode windows
 // and batch rows select per token; a prompt window shares one selection (page scores pooled over its queries and heads)
 // and attends through the MMQ products over a compact operand [selection | its own tokens].
+// a small per-token parameter table to the device unless the device already holds these values (the shadow is what was
+// last uploaded; the decode window's DSA layers send the same table ~50 times per round otherwise)
+static void h2d_if_changed(void* dev, const int* host, size_t n, std::vector<int>& shadow, cudaStream_t s, const char* what) {
+    if (shadow.size() == n && std::memcmp(shadow.data(), host, n * 4) == 0) return;
+    check(cudaMemcpyAsync(dev, host, n * 4, cudaMemcpyHostToDevice, s), what);
+    shadow.assign(host, host + n);
+}
+
 void Engine::dsa_lod(Dev& d, int il, int T, int pos0, float scale) {
     static const bool kLodSync = std::getenv("STRATA_GLM5_LOD_SYNC") != nullptr;   // per-phase syncs of this path alone
     auto lsync = [&](const char* where) {
@@ -884,16 +893,23 @@ void Engine::dsa_lod(Dev& d, int il, int T, int pos0, float scale) {
         if (T > 64) throw std::runtime_error("glm5: LoD: a window of " + std::to_string(T) + " tokens needs the MMQ attention path");
         if (!rows_mode_) {   // the solo window's rows as (slot, position) pairs for the row kernels
             for (int t = 0; t < T; ++t) { d.row_slot_h[t] = jslot(d); d.row_pos_h[t] = pos0 + t; }
-            check(cudaMemcpyAsync(d.row_slot_d, d.row_slot_h, (size_t) T * 4, cudaMemcpyHostToDevice, s), "lod row slots");
-            check(cudaMemcpyAsync(d.row_pos_d, d.row_pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, s), "lod row positions");
+            std::vector<int>& sh = d.row_shadow;   // (slot, position) pairs as one shadow
+            const bool same = sh.size() == (size_t) 2 * T && std::memcmp(sh.data(), d.row_slot_h, (size_t) T * 4) == 0 && std::memcmp(sh.data() + T, d.row_pos_h, (size_t) T * 4) == 0;
+            if (!same) {
+                check(cudaMemcpyAsync(d.row_slot_d, d.row_slot_h, (size_t) T * 4, cudaMemcpyHostToDevice, s), "lod row slots");
+                check(cudaMemcpyAsync(d.row_pos_d, d.row_pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, s), "lod row positions");
+                sh.assign(d.row_slot_h, d.row_slot_h + T); sh.insert(sh.end(), d.row_pos_h, d.row_pos_h + T);
+            }
         }
         int n_cand_max = 0;
         for (int t = 0; t < T; ++t) {
             const int n_kv = (rows_mode_ ? row_pos_[(size_t) t] : pos0 + t) + 1, n_cand = lod_cand(n_kv);
-            prm[t * 8 + 0] = n_cand; prm[t * 8 + 1] = lod_.top_decode; prm[t * 8 + 2] = n_kv; prm[t * 8 + 3] = std::min(lod_.sink_pages, n_cand); prm[t * 8 + 5] = 0;
+            prm[t * 8 + 0] = n_cand; prm[t * 8 + 1] = lod_.top_decode; prm[t * 8 + 2] = n_kv; prm[t * 8 + 3] = std::min(lod_.sink_pages, n_cand); prm[t * 8 + 4] = 0; prm[t * 8 + 5] = 0;
             n_cand_max = std::max(n_cand_max, n_cand);
         }
-        check(cudaMemcpyAsync(d.sel_params, prm, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s), "lod params h2d");
+        const bool pools = lr.idx_route && n_cand_max > 0 && lr.pool_sel;
+        if (pools) for (int t = 0; t < T; ++t) { prm[t * 8 + 1] = lod_.top_pools_decode; prm[t * 8 + 5] = lod_.no_sum ? 1 : 0; }   // the budget in pools (set before the one upload)
+        h2d_if_changed(d.sel_params, prm, (size_t) T * 8, d.sel_shadow, s, "lod params h2d");   // ([4] = n_sel is the select kernel's output: 0 here)
         const float* page_scores = d.score;
         if (lr.idx_route && n_cand_max > 0) {
             // the indexer's pool scores of each row (the DSA kernel), then the max per page
@@ -901,11 +917,9 @@ void Engine::dsa_lod(Dev& d, int il, int T, int pos0, float scale) {
             int* prm2 = d.sel_params2_host;
             int n_pool_max = 0;
             for (int t = 0; t < T; ++t) { prm2[t * 8 + 0] = prm[t * 8 + 0] * ppp; n_pool_max = std::max(n_pool_max, prm2[t * 8 + 0]); }
-            check(cudaMemcpyAsync(d.sel_params2, prm2, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s), "lod params2 h2d");
+            h2d_if_changed(d.sel_params2, prm2, (size_t) T * 8, d.sel2_shadow, s, "lod params2 h2d");
             dsa_score_rows(pooled_tab_[(size_t) il], d.row_slot_d, d.iq, d.iw, d.score, d.sel_params2, n_pool_max, T, hp_.idx_heads, hp_.idx_dim, ld_pool, d.stream);
             if (lr.pool_sel) {
-                for (int t = 0; t < T; ++t) { prm[t * 8 + 1] = lod_.top_pools_decode; prm[t * 8 + 5] = lod_.no_sum ? 1 : 0; }   // the budget in pools
-                check(cudaMemcpyAsync(d.sel_params, prm, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s), "lod params h2d");
                 page_scores = nullptr;
                 lod_select_pools(d.score, d.sel_params, T, ps, KP, d.sel, ld_pool, n_sel_max_, d.stream);
             } else {
@@ -945,7 +959,7 @@ void Engine::dsa_lod(Dev& d, int il, int T, int pos0, float scale) {
     // the shared selection: the query "at pos0" with the prefill budget; page scores = max over the window's (query, head) rows
     const int n_cand = lod_cand(pos0);
     prm[0] = n_cand; prm[1] = lod_.top_prefill; prm[2] = pos0; prm[3] = std::min(lod_.sink_pages, n_cand); prm[5] = 0;
-    check(cudaMemcpyAsync(d.sel_params, prm, 8 * 4, cudaMemcpyHostToDevice, s), "lod params h2d");
+    prm[4] = 0; h2d_if_changed(d.sel_params, prm, 8, d.sel_shadow, s, "lod params h2d");
     if (n_cand > prm[3] && lr.idx_route) {
         // the indexer's pool scores for the window: S = iq (T*IH rows, padded to 256) x pooled keys (Q8_0, 256), per pool
         // the max over the queries of sum_h relu(S) w; then the max per page
@@ -1006,7 +1020,7 @@ void Engine::dsa_lod(Dev& d, int il, int T, int pos0, float scale) {
     if (lr.pool_sel) {   // the exact set = the indexer's top pools (DSA's granularity); the host sizes the operand by the bound
         const int KP = hp_.kpool, ld_pool = max_ctx_ / KP + 1;
         prm[1] = lod_.top_pools; prm[5] = lod_.no_sum ? 1 : 0;
-        check(cudaMemcpyAsync(d.sel_params, prm, 8 * 4, cudaMemcpyHostToDevice, s), "lod params h2d");
+        prm[4] = 0; h2d_if_changed(d.sel_params, prm, 8, d.sel_shadow, s, "lod params h2d");
         lod_select_pools(d.lod_tok, d.sel_params, 1, ps, KP, d.sel, ld_pool, n_sel_max_, d.stream);
         const int sink = std::min(lod_.sink_pages, n_cand), n_top = std::min(lod_.top_pools, std::max(n_cand - sink, 0) * (ps / KP));
         n_sel = sink * ps + n_top * KP + (pos0 - n_cand * ps) + (lod_.no_sum ? 0 : n_cand - sink);
@@ -1152,6 +1166,7 @@ void Engine::dsa_layer(Dev& d, int il, int T, int pos0, const float* xn, float* 
         prm[t * 8 + 3] = hp_.kpool_tail ? n_tail : 0;
     }
     check(cudaMemcpyAsync(d.sel_params, prm, (size_t) T * 8 * 4, cudaMemcpyHostToDevice, s), "sel params h2d");
+    d.sel_shadow.clear();   // (the decode path's shadow no longer describes the device table)
     // the pools completed inside this window (pool p covers cells p*KP .. p*KP+KP-1), all at once; token t reads
     // only the first (pos0+t+1)/KP of them
     {
@@ -1495,8 +1510,8 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     // the hits: groups [0, cnt[0]) - gate then up
     auto gate_up = [&](const int* gb, const int* ge) {
         if (decq2k) {
-            strata::glm5::q2k::dec_wmma(d.grp_w, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_g, E, FF, d.stream);
-            strata::glm5::q2k::dec_wmma(d.grp_wu, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_u, E, FF, d.stream);
+            strata::glm5::q2k::dec_wmma(d.grp_w, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_g, E, FF, d.stream,
+                                        d.grp_wu, d.ffn_u);   // gate and up in one launch
         } else {
             strata::kernels::native_mmvq_grouped((int) L.exp_gate.type, d.grp_w, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.ffn_g, E, FF, max_pairs_, d.stream);
             strata::kernels::native_mmvq_grouped((int) L.exp_up.type, d.grp_wu, d.q8_g, d.grp_col0, d.grp_ncols, d.grp_orow, gb, ge, d.ffn_u, E, FF, max_pairs_, d.stream);
@@ -1817,11 +1832,11 @@ void Engine::prof_report(int T) {
         total += ms;
     }
     if (host_prof_[0] + host_prof_[2] > 0) { std::fprintf(stderr, "glm5 prof: host per window (ms): prefetch enqueue %.0f, group+quant enqueue %.0f, cnt sync wait %.0f, mmq gate|up enqueue %.0f, rest of moe %.0f\n", host_prof_[0], host_prof_[1], host_prof_[2], host_prof_[3], host_prof_[4]); for (double& v : host_prof_) v = 0; }
-    std::fprintf(stderr, "glm5 prof: window T %d, %.0f ms of GPU phases:", T, total);
+    std::fprintf(stderr, "glm5 prof: window T %d, %.1f ms of GPU phases:", T, total);
     std::vector<std::pair<double, std::string>> v;
     for (auto& kv : acc) v.push_back({kv.second, kv.first});
     std::sort(v.rbegin(), v.rend());
-    for (auto& e : v) std::fprintf(stderr, " %s %.0f (%.0f%%)", e.second.c_str(), e.first, 100.0 * e.first / total);
+    for (auto& e : v) std::fprintf(stderr, " %s %.2f (%.0f%%)", e.second.c_str(), e.first, 100.0 * e.first / total);
     std::fprintf(stderr, "\n");
     for (auto& m : prof_) cudaEventDestroy(static_cast<cudaEvent_t>(m.ev));
     prof_.clear();
