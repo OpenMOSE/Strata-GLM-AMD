@@ -98,9 +98,11 @@ __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict_
         const uint32_t dmw = sbw[20];
         const float d = __half2float(__ushort_as_half((unsigned short) (dmw & 0xffff)));
         const float dmin = __half2float(__ushort_as_half((unsigned short) (dmw >> 16)));
-        i32x8 acc[NT];
+        // two accumulator sets per column tile (the even and the odd sub-blocks): twice the independent WMMA chains in
+        // flight for the same registers' worth of columns; int32 sums, so the total is the same bits
+        i32x8 acc[NT], acc2[NT];
 #pragma unroll
-        for (int n = 0; n < NT; ++n) acc[n] = i32x8{0, 0, 0, 0, 0, 0, 0, 0};
+        for (int n = 0; n < NT; ++n) { acc[n] = i32x8{0, 0, 0, 0, 0, 0, 0, 0}; acc2[n] = i32x8{0, 0, 0, 0, 0, 0, 0, 0}; }
 #pragma unroll
         for (int s = 0; s < 16; ++s) {
             const uint32_t sc = (scw[s >> 2] >> (8 * (s & 3))) & 0x0f;
@@ -114,9 +116,14 @@ __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict_
                 const i32x4 b = *reinterpret_cast<const i32x4*>(brow[n] + sb * 256 + 16 * s);
                 // the operand order: lane l's result element e is sum_k (first operand of lane 2e + l/16) . (second operand of lane l%16),
                 // so the activations go first: lane l holds weight row l%16 and activation columns 2e + l/16 (measured on gfx1100)
-                acc[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, a, acc[n], false);
+                if (s & 1) acc2[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, a, acc2[n], false);
+                else acc[n] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, b, true, a, acc[n], false);
             }
         }
+#pragma unroll
+        for (int n = 0; n < NT; ++n)
+#pragma unroll
+            for (int q = 0; q < 8; ++q) acc[n][q] += acc2[n][q];
         // the min term: A = m_s (16 bytes), B = suma_s split into a low byte (unsigned) and a high byte (signed)
         i32x4 am;
 #pragma unroll

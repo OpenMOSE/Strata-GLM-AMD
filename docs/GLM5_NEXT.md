@@ -1118,4 +1118,8 @@ mode each promotion's save of the victim to the host competes for the memory bus
 column-tile switch for the prompt WMMA kernel (`STRATA_GLM5_Q2K_NT`, 2 / 3 / 4: wider tiles amortize the weight
 dequantization over more columns, but the 4K window measured 5.14 / 5.25 / 5.70 s - 2 stays), loan, promotion and copy
 counters on the CLI's last line. The 4K window's phases now: the expert products 37%, the KDA q | k | v products 12%, the
-DSA attention 10%, the KDA scan 9%, mHC 8%.
+DSA attention 10%, the KDA scan 9%, mHC 8%. A kernel census of that window: llama.cpp's Q8_0 MMQ 1.4 s (the dense
+projections ~1.0 s at ~27 TMAC/s, the LoD indexer's 1,700 small products 0.35 s), the Q2_K WMMA kernel 1.3 s (~22
+TMAC/s), the KDA scan 0.46 s, the mHC mixes 0.2 s, the BF16 GEMMs (f_b / g_b / fab / kv_a) 0.28 s. The Q2_K kernel with
+two accumulator sets per column tile (even / odd sub-blocks, int32: the same bits): 5.15 -> 5.12 s - its limit is not the
+accumulator chain.

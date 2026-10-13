@@ -1062,4 +1062,7 @@ batch の行も持ち直す (窓あたり 73.8 → 65.8 ms、ヒット 92%) が�
 既定 0; `_MAX` は層・窓あたり)。この回ではほかに: prompt WMMA
 カーネルの列タイル幅の切り替え (`STRATA_GLM5_Q2K_NT`、2 / 3 / 4: 広いタイルは重みの逆量子化をより多くの列で分担するが、4K 窓は
 5.14 / 5.25 / 5.70 s - 2 のまま)、CLI 最終行に貸出・昇格・コピーの集計。4K 窓の内訳はいま: expert 積 37%、KDA の q | k | v 積 12%、
-DSA attention 10%、KDA scan 9%、mHC 8%。
+DSA attention 10%、KDA scan 9%、mHC 8%。その窓のカーネル調査: llama.cpp の Q8_0 MMQ 1.4 s (dense 射影約 1.0 s、約 27 TMAC/s; LoD indexer の
+小さな積 1,700 回 0.35 s)、Q2_K WMMA カーネル 1.3 s (約 22 TMAC/s)、KDA scan 0.46 s、mHC mixes 0.2 s、BF16 GEMM (f_b / g_b / fab / kv_a)
+0.28 s。Q2_K カーネルを列タイルごとに累積器 2 組 (偶数 / 奇数サブブロック、int32 なので同じビット) にすると 5.15 → 5.12 s - 限界は
+累積器の連鎖ではない。
