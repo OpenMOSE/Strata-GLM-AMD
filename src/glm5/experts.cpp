@@ -714,10 +714,12 @@ void ExpertStore::init_cpu(const Model& m) {
     size_t act_max = 0, h_max = 0;
     int64_t ff_max = 0;
     for (int il = hp.n_dense_lead; il < NL; ++il) { act_max = std::max(act_max, fmt_[(size_t) il].act_bytes); h_max = std::max(h_max, fmt_[(size_t) il].h_bytes); ff_max = std::max(ff_max, fmt_[(size_t) il].n_ff); }
-    act_.assign(8, std::vector<uint8_t>(act_max + 64));
-    ff_.assign(64, std::vector<float>((size_t) ff_max));
-    hq_.assign(64, std::vector<uint8_t>(h_max + 64));
-    y_pin_rows_ = NL * 64;
+    y_rows_ = kMidCpuRows;   // the decode windows use at most 64 rows; the mid-size split up to kMidCpuRows
+    act_.assign(2048, std::vector<uint8_t>(act_max + 64));
+    ff_.assign((size_t) y_rows_, std::vector<float>((size_t) ff_max));
+    hq_.assign((size_t) y_rows_, std::vector<uint8_t>(h_max + 64));
+    // two blocks by layer parity: layer il's rows are copied (and waited on at its combine) before layer il + 2's are written
+    y_pin_rows_ = 2 * y_rows_;
     void* p = nullptr;
     check(cudaHostAlloc(&p, (size_t) y_pin_rows_ * hp.n_embd * 4, cudaHostAllocPortable | cudaHostAllocMapped), "cudaHostAlloc y_pin");
     y_pin_ = static_cast<float*>(p);
@@ -903,6 +905,183 @@ void ExpertStore::reset_loans() {
     }
 }
 
+int ExpertStore::cpu_run(int il, const std::vector<Miss>& misses, int T, const float* x_rows, float* y_dev, int n_embd, uint32_t tok, uint32_t* h_flag2,
+                         uint32_t* flag2_dev, void* cs_, std::chrono::steady_clock::time_point& tl) {
+    LayerExperts& E = layers_[(size_t) il];
+    const strata::kernels::cpu::NativeFmt& f = fmt_[(size_t) il];
+    cudaStream_t cs = static_cast<cudaStream_t>(cs_);
+    auto lap = [&](int i, std::chrono::steady_clock::time_point& t) { const auto n = std::chrono::steady_clock::now(); cpu_t_[i] += std::chrono::duration<double, std::milli>(n - t).count(); t = n; };
+    // the tokens' inputs quantized for the gate/up dot products
+    for (int t = 0; t < T; ++t) strata::kernels::cpu::native_quant_act(f, x_rows + (size_t) t * n_embd, act_[(size_t) t].data());
+    lap(1, tl);
+    float* y_layer = y_pin_ + (size_t) ((il & 1) * y_rows_) * n_embd;   // row r of this layer's pinned block = ff row r
+    const auto* tr = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
+    const float limit = clamp_limit_[(size_t) il];
+    int n_pairs = 0;
+    // phase A: ff[pair] = swiglu_clamp(gate . a, up . a) for the rows of each expert, in 128-row chunks
+    std::vector<std::function<void()>> jobs;
+    const int n_ff = (int) f.n_ff;
+    for (const Miss& ms : misses) {
+        const uint8_t* blob = E.host_gate[(size_t) ms.e];
+        n_pairs += (int) ms.toks.size();
+        for (int r0 = 0; r0 < n_ff; r0 += 128) {
+            const int r1 = std::min(n_ff, r0 + 128);
+            jobs.emplace_back([this, &ms, blob, r0, r1, tr, &f, limit]() {
+                for (size_t i = 0; i < ms.toks.size(); ++i) {
+                    const void* a = act_[(size_t) ms.toks[i]].data();
+                    float* ff = ff_[(size_t) (ms.ff0 + (int) i)].data();
+                    for (int r = r0; r < r1; ++r) {
+                        float g = 0.f, u = 0.f;
+                        tr->vec_dot((int) f.n_embd, &g, 0, blob + (size_t) r * f.gu_row, 0, a, 0, 1);
+                        tr->vec_dot((int) f.n_embd, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a, 0, 1);
+                        if (limit > 0.f) { g = std::min(g, limit); u = std::min(std::max(u, -limit), limit); }
+                        ff[r] = g / (1.f + std::exp(-g)) * u;
+                    }
+                }
+            });
+        }
+    }
+    pool_.run(std::move(jobs));
+    lap(2, tl);
+    // the swiglu outputs quantized for the down dot products
+    for (const Miss& ms : misses)
+        for (size_t i = 0; i < ms.toks.size(); ++i) {
+            const size_t pr = (size_t) (ms.ff0 + (int) i);
+            strata::kernels::cpu::native_quant_h(f, ff_[pr].data(), hq_[pr].data());
+        }
+    lap(3, tl);
+    // phase B: y[pair] = down . hq, in 512-row chunks
+    jobs.clear();
+    for (const Miss& ms : misses) {
+        const uint8_t* blob = E.host_gate[(size_t) ms.e];
+        for (int r0 = 0; r0 < n_embd; r0 += 512) {
+            const int r1 = std::min(n_embd, r0 + 512);
+            jobs.emplace_back([this, &ms, blob, r0, r1, &f, y_layer, n_embd]() {
+                std::vector<const void*> hq(ms.toks.size());
+                std::vector<float*> out(ms.toks.size());
+                for (size_t i = 0; i < ms.toks.size(); ++i) {
+                    const size_t pr = (size_t) (ms.ff0 + (int) i);
+                    hq[i] = hq_[pr].data();
+                    out[i] = y_layer + pr * n_embd;
+                }
+                strata::kernels::cpu::native_down_rows(f, blob, hq.data(), (int) ms.toks.size(), out.data(), r0, r1);
+            });
+        }
+    }
+    pool_.run(std::move(jobs));
+    lap(4, tl);
+    // the CPU-served pairs' rows to the device (per expert: a contiguous run of rows), then the flag
+    if (y_pin_dev_ && !misses.empty()) {
+        // one kernel reads the whole layer's rows from the mapped pinned block (a kernel launch needs the device current)
+        int cur = 0; cudaGetDevice(&cur);
+        if (cur != E.device) check(cudaSetDevice(E.device), "cudaSetDevice");
+        for (const Miss& ms : misses)
+            strata::glm5::copy_host_rows(y_pin_dev_ + (size_t) ((il & 1) * y_rows_) * n_embd + (size_t) ms.ff0 * n_embd, y_dev + (size_t) ms.row0 * n_embd,
+                                         ms.toks.size() * (size_t) n_embd, cs);
+        if (cur != E.device) check(cudaSetDevice(cur), "cudaSetDevice");
+    } else
+    for (const Miss& ms : misses)
+        check(cudaMemcpyAsync(y_dev + (size_t) ms.row0 * n_embd, y_layer + (size_t) ms.ff0 * n_embd, ms.toks.size() * (size_t) n_embd * 4,
+                              cudaMemcpyHostToDevice, cs), "cpu y h2d");
+    if (misses.empty()) __atomic_store_n(h_flag2, tok, __ATOMIC_RELEASE);
+    else if (flag2_dev) flag_kernel(E.device, flag2_dev, tok, cs);
+    lap(5, tl);
+    return n_pairs;
+}
+
+int ExpertStore::serve_mid(int il, const int32_t* ids, int n, int T, const float* x_rows, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, uint32_t* h_flag2,
+                           uint32_t* flag2_dev, float* y_dev, int n_embd, int32_t* skip_h, uint8_t* ring_dst, uint64_t stride, void* wait_event) {
+    LayerExperts& E = layers_[(size_t) il];
+    if (route_log_) { std::fprintf(route_log_, "T %u %d", tok, il); for (int j2 = 0; j2 < n; ++j2) std::fprintf(route_log_, " %d", ids[j2]); std::fprintf(route_log_, "\n"); }
+    const size_t di = (size_t) device_index_of_layer(il);
+    cudaStream_t cs = static_cast<cudaStream_t>(copy_streams_[di]);
+    const int K = n / T, ne = (int) E.slot_of.size();
+    // the ranks of the non-resident experts (k_moe_group's order for the ring), the counts per expert
+    if (nonres_rank_.empty()) nonres_rank_.resize(layers_.size());
+    std::vector<int32_t>& rank = nonres_rank_[(size_t) il];
+    rank.assign((size_t) ne, -1);
+    int n_nonres = 0;
+    for (int e = 0; e < ne; ++e) if (E.slot_of[(size_t) e] < 0) rank[(size_t) e] = n_nonres++;
+    std::vector<int> count((size_t) ne, 0);
+    for (int j = 0; j < n; ++j) {
+        const int e = ids[j];
+        if (e < 0 || e >= ne) throw std::runtime_error("glm5 experts: a routing id out of range (corrupt activations)");
+        ++counts_[(size_t) il][(size_t) e]; ++count[(size_t) e];
+        if (E.slot_of[(size_t) e] >= 0) ++hits_; else ++misses_;
+    }
+    for (int r = 0; r < n_nonres; ++r) skip_h[r] = 0;
+    // the MMQ layout: the resident experts' pairs first (slot order), then the non-resident ones' by rank
+    int col = 0;
+    for (int sl = 0; sl < E.n_slots; ++sl) col += count[(size_t) E.expert_of[(size_t) sl]];
+    std::vector<int> miss_e, col0((size_t) ne, -1);
+    for (int e = 0; e < ne; ++e) if (E.slot_of[(size_t) e] < 0 && count[(size_t) e]) { col0[(size_t) e] = col; col += count[(size_t) e]; miss_e.push_back(e); }
+    distinct_misses_ += miss_e.size();
+    if (!miss_e.empty()) ++layers_missed_;
+    if (miss_e.empty()) { __atomic_store_n(h_flag, tok, __ATOMIC_RELEASE); __atomic_store_n(h_flag2, tok, __ATOMIC_RELEASE); return 0; }
+    const auto t_cpu0 = std::chrono::steady_clock::now();
+    auto tl = t_cpu0;
+    ++cpu_calls_;
+    // the split (as serve_cpu): every miss starts on the CPU, the experts with the most pairs move to PCIe while that
+    // shortens the longer side; then the CPU's rows capped at kMidCpuRows (the largest groups move over first)
+    std::vector<int> pairs_of((size_t) miss_e.size());
+    for (size_t i = 0; i < miss_e.size(); ++i) pairs_of[i] = count[(size_t) miss_e[i]];
+    // only the Q2_K layers' products honor the skip mask (the WMMA kernel); the other layers' experts all go over PCIe
+    const bool cpu_ok = E.gu_type == 10 && E.d_type == 10;
+    std::vector<char> on_cpu(miss_e.size(), cpu_ok ? 1 : 0);
+    double cpu_t = 0, dma_t = 0;
+    for (size_t i = 0; i < miss_e.size(); ++i) if (on_cpu[i]) cpu_t += pairs_of[i] * cpu_pair_ms_; else dma_t += dma_ms_;
+    auto move_largest = [&]() {
+        int best = -1;
+        for (size_t i = 0; i < miss_e.size(); ++i) if (on_cpu[i] && (best < 0 || pairs_of[i] > pairs_of[(size_t) best])) best = (int) i;
+        if (best < 0) return false;
+        on_cpu[(size_t) best] = 0; cpu_t -= pairs_of[(size_t) best] * cpu_pair_ms_; dma_t += dma_ms_;
+        return true;
+    };
+    for (;;) {
+        int best = -1;
+        for (size_t i = 0; i < miss_e.size(); ++i) if (on_cpu[i] && (best < 0 || pairs_of[i] > pairs_of[(size_t) best])) best = (int) i;
+        if (best < 0) break;
+        if (std::max(cpu_t - pairs_of[(size_t) best] * cpu_pair_ms_, dma_t + dma_ms_) >= std::max(cpu_t, dma_t)) break;
+        move_largest();
+    }
+    for (;;) {
+        int rows = 0;
+        for (size_t i = 0; i < miss_e.size(); ++i) if (on_cpu[i]) rows += pairs_of[i];
+        if (rows <= kMidCpuRows || !move_largest()) break;
+    }
+    // the PCIe side into the ring (after the buffer's last reader), its flag behind the copies
+    int n_dma = 0;
+    if (wait_event) check(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(wait_event), 0), "ring wait");
+    for (size_t i = 0; i < miss_e.size(); ++i) {
+        if (on_cpu[i]) continue;
+        const int e = miss_e[i];
+        if (!E.host_pinned[(size_t) e]) throw std::runtime_error("serve_mid: an unpinned expert (the pin limit)");
+        check(cudaMemcpyAsync(ring_dst + (uint64_t) rank[(size_t) e] * stride, E.host_gate[(size_t) e], E.blob, cudaMemcpyHostToDevice, cs), "ring dma");
+        ++n_dma;
+    }
+    prefetched_ += (uint64_t) n_dma;
+    std::vector<Miss> misses;
+    int ff0 = 0;
+    for (size_t i = 0; i < miss_e.size(); ++i) {
+        if (!on_cpu[i]) continue;
+        const int e = miss_e[i];
+        if (!E.host_pinned[(size_t) e]) throw std::runtime_error("serve_mid: an unpinned expert (the pin limit)");
+        skip_h[rank[(size_t) e]] = 1;
+        Miss ms{e, {}, col0[(size_t) e], ff0};
+        for (int j = 0; j < n; ++j) if (ids[j] == e) ms.toks.push_back(j / K);
+        ff0 += (int) ms.toks.size();
+        misses.push_back(std::move(ms));
+    }
+    if (n_dma > 0) { if (flag_dev) flag_kernel(E.device, flag_dev, tok, cs); } else __atomic_store_n(h_flag, tok, __ATOMIC_RELEASE);
+    cpu_t_[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count(); tl = std::chrono::steady_clock::now();
+    const int n_cpu_pairs = cpu_run(il, misses, T, x_rows, y_dev, n_embd, tok, h_flag2, flag2_dev, cs, tl);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu0).count();
+    cpu_ms_ += ms;
+    cpu_pairs_ += (uint64_t) n_cpu_pairs;
+    if (n_cpu_pairs > 0 && !cpu_pair_fixed_) cpu_pair_ms_ = 0.9 * cpu_pair_ms_ + 0.1 * (ms / n_cpu_pairs);
+    return (int) miss_e.size();
+}
+
 int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float* x_rows, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, uint32_t* h_flag2,
                            uint32_t* flag2_dev, float* y_dev, int n_embd, int* miss_cpu, int* miss_slot, int* miss_out, int max_swaps) {
     LayerExperts& E = layers_[(size_t) il];
@@ -1029,89 +1208,15 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
         }
     }
     lap(0, tl);
-    // the tokens' inputs quantized for the gate/up dot products
-    for (int t = 0; t < T; ++t) strata::kernels::cpu::native_quant_act(f, x_rows + (size_t) t * n_embd, act_[(size_t) t].data());
-    lap(1, tl);
-    // per missed expert: its tokens (token order), its pair rows
-    struct Miss { int e; std::vector<int> toks; int row0; };
     std::vector<Miss> misses;
     for (size_t i = 0; i < miss_e.size(); ++i) {
         if (!on_cpu[i]) continue;
         const int e = miss_e[i];
-        Miss ms{e, {}, col0[(size_t) e]};
+        Miss ms{e, {}, col0[(size_t) e], col0[(size_t) e] - first_miss_row};
         for (int j = 0; j < n; ++j) if (ids[j] == e) ms.toks.push_back(j / K);
         misses.push_back(std::move(ms));
     }
-    float* y_layer = y_pin_ + (size_t) (il * 64) * n_embd;   // row r of this layer's pinned block = pair row first_miss_row + r
-    const auto* tr = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
-    const float limit = clamp_limit_[(size_t) il];
-    // phase A: ff[pair] = swiglu_clamp(gate . a, up . a) for the rows of each expert, in 128-row chunks
-    std::vector<std::function<void()>> jobs;
-    const int n_ff = (int) f.n_ff;
-    for (const Miss& ms : misses) {
-        const uint8_t* blob = E.host_gate[(size_t) ms.e];
-        for (int r0 = 0; r0 < n_ff; r0 += 128) {
-            const int r1 = std::min(n_ff, r0 + 128);
-            jobs.emplace_back([this, &ms, blob, r0, r1, tr, &f, limit, first_miss_row]() {
-                for (size_t i = 0; i < ms.toks.size(); ++i) {
-                    const void* a = act_[(size_t) ms.toks[i]].data();
-                    float* ff = ff_[(size_t) (ms.row0 - first_miss_row + (int) i)].data();
-                    for (int r = r0; r < r1; ++r) {
-                        float g = 0.f, u = 0.f;
-                        tr->vec_dot((int) f.n_embd, &g, 0, blob + (size_t) r * f.gu_row, 0, a, 0, 1);
-                        tr->vec_dot((int) f.n_embd, &u, 0, blob + f.up_off + (size_t) r * f.gu_row, 0, a, 0, 1);
-                        if (limit > 0.f) { g = std::min(g, limit); u = std::min(std::max(u, -limit), limit); }
-                        ff[r] = g / (1.f + std::exp(-g)) * u;
-                    }
-                }
-            });
-        }
-    }
-    pool_.run(std::move(jobs));
-    lap(2, tl);
-    // the swiglu outputs quantized for the down dot products
-    for (const Miss& ms : misses)
-        for (size_t i = 0; i < ms.toks.size(); ++i) {
-            const size_t pr = (size_t) (ms.row0 - first_miss_row + (int) i);
-            strata::kernels::cpu::native_quant_h(f, ff_[pr].data(), hq_[pr].data());
-        }
-    lap(3, tl);
-    // phase B: y[pair] = down . hq, in 512-row chunks
-    jobs.clear();
-    for (const Miss& ms : misses) {
-        const uint8_t* blob = E.host_gate[(size_t) ms.e];
-        for (int r0 = 0; r0 < n_embd; r0 += 512) {
-            const int r1 = std::min(n_embd, r0 + 512);
-            jobs.emplace_back([this, &ms, blob, r0, r1, &f, y_layer, first_miss_row, n_embd]() {
-                std::vector<const void*> hq(ms.toks.size());
-                std::vector<float*> out(ms.toks.size());
-                for (size_t i = 0; i < ms.toks.size(); ++i) {
-                    const size_t pr = (size_t) (ms.row0 - first_miss_row + (int) i);
-                    hq[i] = hq_[pr].data();
-                    out[i] = y_layer + pr * n_embd;
-                }
-                strata::kernels::cpu::native_down_rows(f, blob, hq.data(), (int) ms.toks.size(), out.data(), r0, r1);
-            });
-        }
-    }
-    pool_.run(std::move(jobs));
-    lap(4, tl);
-    // the CPU-served pairs' rows to the device (per expert: a contiguous run of rows), then the flag
-    if (y_pin_dev_ && !misses.empty()) {
-        // one kernel reads the whole layer's rows from the mapped pinned block (a kernel launch needs the device current)
-        int cur = 0; cudaGetDevice(&cur);
-        if (cur != E.device) check(cudaSetDevice(E.device), "cudaSetDevice");
-        for (const Miss& ms : misses)
-            strata::glm5::copy_host_rows(y_pin_dev_ + (size_t) (il * 64) * n_embd + (size_t) (ms.row0 - first_miss_row) * n_embd, y_dev + (size_t) ms.row0 * n_embd,
-                                         ms.toks.size() * (size_t) n_embd, cs);
-        if (cur != E.device) check(cudaSetDevice(cur), "cudaSetDevice");
-    } else
-    for (const Miss& ms : misses)
-        check(cudaMemcpyAsync(y_dev + (size_t) ms.row0 * n_embd, y_layer + (size_t) (ms.row0 - first_miss_row) * n_embd, ms.toks.size() * (size_t) n_embd * 4,
-                              cudaMemcpyHostToDevice, cs), "cpu y h2d");
-    if (misses.empty()) __atomic_store_n(h_flag2, tok, __ATOMIC_RELEASE);
-    else if (flag2_dev) flag_kernel(E.device, flag2_dev, tok, cs);
-    lap(5, tl);
+    cpu_run(il, misses, T, x_rows, y_dev, n_embd, tok, h_flag2, flag2_dev, cs, tl);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_cpu0).count();
     cpu_ms_ += ms;
     cpu_pairs_ += (uint64_t) n_cpu_pairs;

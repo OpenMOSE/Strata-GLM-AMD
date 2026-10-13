@@ -9,6 +9,7 @@
 
 #include "strata/glm5/glm5.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <cstdint>
@@ -117,6 +118,13 @@ public:
     /// expert id, token order inside a group) and the layer's flag is written after them.  Returns the miss count.
     int serve_cpu(int il, const int32_t* ids, int n, int T, const float* x_rows, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, uint32_t* h_flag2,
                   uint32_t* flag2_dev, float* y_dev, int n_embd, int* miss_cpu, int* miss_slot, int* miss_out, int max_swaps);   ///< flag: the DMA'd misses landed; flag2: the CPU's rows landed   ///< miss_cpu[m] (mapped host ints, m = the miss's rank in ascending id): 1 = computed here, 0 = DMA'd to staging slot m
+    /// A mid-size prompt window (9 <= T < 256, the MMQ path with the ring): the missed experts split between PCIe (into the
+    /// ring at rank * stride, as serve_ring) and the CPU (their pair rows computed from the pinned blobs into y_dev at the
+    /// MMQ layout's rows, at most kMidCpuRows of them); skip_h[rank] = 1 marks the CPU-served experts for the device's
+    /// products.  flag: the ring copies landed; flag2: the CPU's rows landed.  Returns the distinct misses.
+    int serve_mid(int il, const int32_t* ids, int n, int T, const float* x_rows, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, uint32_t* h_flag2,
+                  uint32_t* flag2_dev, float* y_dev, int n_embd, int32_t* skip_h, uint8_t* ring_dst, uint64_t stride, void* wait_event);
+    static constexpr int kMidCpuRows = 1024;  ///< the CPU's pair rows per layer in a mid-size window (the pinned result block, by layer parity)
     /// Every layer's experts are pinned and ggml-cpu covers their formats: serve_cpu is available.
     bool cpu_ready() const { return cpu_ready_; }
     void init_cpu(const Model& m);
@@ -253,6 +261,12 @@ private:
     float* y_pin_dev_ = nullptr;                         ///< its device pointer (mapped): the rows are read by a kernel, not the copy engine
     int y_pin_rows_ = 0;
     std::vector<uint8_t> seen_;   ///< scratch of serve(): distinct misses
+    struct Miss { int e; std::vector<int> toks; int row0; int ff0; };   ///< a CPU-served expert: its tokens (token order), its first pair row in the device buffer, its first row in ff_/hq_/y_pin
+    /// the CPU's products for `misses` of layer il (x_rows: the window's MoE inputs, T of them), their rows copied into
+    /// y_dev and flag2 written behind them; returns the pair count
+    int cpu_run(int il, const std::vector<Miss>& misses, int T, const float* x_rows, float* y_dev, int n_embd, uint32_t tok, uint32_t* h_flag2,
+                uint32_t* flag2_dev, void* cs, std::chrono::steady_clock::time_point& tl);
+    int y_rows_ = 64;             ///< the pinned result block's rows per layer (kMidCpuRows when the mid-size split is on)
     double file_ms_ = 0;
     int32_t pick_victim(LayerExperts& E, uint32_t tok, uint32_t protect);
     void dma_miss(LayerExperts& E, int il, size_t di, size_t m, int e, uint32_t tok, int* miss_slot, int* miss_out, int max_swaps, int& swapped,

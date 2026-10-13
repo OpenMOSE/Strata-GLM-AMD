@@ -253,6 +253,7 @@ void Model::init(const std::string&, bool verbose) {
             L.sh_gate = up("ffn_gate_shexp.weight");
             L.sh_up = up("ffn_up_shexp.weight");
             L.sh_down = up("ffn_down_shexp.weight");
+            L.sh_gu = concat_rows(L.sh_gate, L.sh_up);
             L.exp_gate = expert(*gguf_, b + "ffn_gate_exps.weight");
             L.exp_up = expert(*gguf_, b + "ffn_up_exps.weight");
             L.exp_down = expert(*gguf_, b + "ffn_down_exps.weight");
@@ -272,6 +273,23 @@ Model::~Model() {
 
 uint64_t Model::device_bytes(int ordinal) const {
     return ordinal >= 0 && (size_t) ordinal < bytes_per_device_.size() ? bytes_per_device_[(size_t) ordinal] : 0;
+}
+
+// a and b (same type, same row length) stacked as one matrix [a.ne1 + b.ne1][ne0] on a's device
+DevTensor Model::concat_rows(const DevTensor& a, const DevTensor& b) {
+    if (!a.present() || !b.present() || a.type != b.type || a.ne0 != b.ne0 || a.device != b.device) return {};
+    check(cudaSetDevice(a.device), "cudaSetDevice");
+    void* d = nullptr;
+    check(cudaMalloc(&d, a.bytes + b.bytes), "cudaMalloc concat");
+    allocations_.push_back(d);
+    alloc_device_.push_back(a.device);
+    check(cudaMemcpy(d, a.data, a.bytes, cudaMemcpyDeviceToDevice), "concat a");
+    check(cudaMemcpy(static_cast<uint8_t*>(d) + a.bytes, b.data, b.bytes, cudaMemcpyDeviceToDevice), "concat b");
+    bytes_ += a.bytes + b.bytes;
+    bytes_per_device_[(size_t) a.device] += a.bytes + b.bytes;
+    DevTensor r = a;
+    r.data = d; r.bytes = a.bytes + b.bytes; r.ne1 = a.ne1 + b.ne1;
+    return r;
 }
 
 DevTensor Model::upload(const strata::GgufModel& gg, const std::string& name, int device, bool required) {
@@ -352,6 +370,7 @@ void Model::attach_mtp(const std::string& path, bool verbose) {
     L.sh_gate = up("ffn_gate_shexp.weight");
     L.sh_up = up("ffn_up_shexp.weight");
     L.sh_down = up("ffn_down_shexp.weight");
+    L.sh_gu = concat_rows(L.sh_gate, L.sh_up);
     L.exp_gate = expert(*mtp_gguf_, b + "ffn_gate_exps.weight");
     L.exp_up = expert(*mtp_gguf_, b + "ffn_up_exps.weight");
     L.exp_down = expert(*mtp_gguf_, b + "ffn_down_exps.weight");

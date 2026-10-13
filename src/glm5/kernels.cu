@@ -112,7 +112,8 @@ __global__ void k_mhc_rs(const float* __restrict__ R, float* rs, int n, float ep
     ss = block_sum(ss, sh);
     if (threadIdx.x == 0) *rs = 1.0f / sqrtf(ss / n + eps);
 }
-constexpr int kMixSlices = 8;
+constexpr int kMixSlices = 8;      // the exact kernels' slices per mix row
+constexpr int kPartStride = 64;    // the part buffer's slices per mix row (the wide kernel writes 64)
 // block (row, slice): the dot of mix row `row` with the normalised R over slice `slice` of the hc*n_embd axis
 __global__ void k_mhc_mixes(const float* __restrict__ R, const float* __restrict__ fn, const float* __restrict__ rs,
                             float* __restrict__ part, int n) {
@@ -129,17 +130,17 @@ __global__ void k_mhc_mixes(const float* __restrict__ R, const float* __restrict
         acc += a.x * (b.x * s) + a.y * (b.y * s) + a.z * (b.z * s) + a.w * (b.w * s);
     }
     acc = block_sum(acc, sh);
-    if (threadIdx.x == 0) part[row * kMixSlices + slice] = acc;
+    if (threadIdx.x == 0) part[row * kPartStride + slice] = acc;
 }
 __global__ void k_mhc_nonlin(const float* __restrict__ part, const float* __restrict__ scale,
                              const float* __restrict__ base, float* mixes, float* pre, float* post, float* comb, int hc,
-                             int iters, float eps) {
+                             int iters, float eps, int n_slices) {
     // one warp: lanes 0..hc-1 the pre/post scalars, lanes 0..hc*hc-1 the comb entries e = dst + hc*src
     // (hc == 4: dst = lane & 3, src = lane >> 2; shuffles over xor 1,2 reduce over dst, over xor 4,8 over src)
     const int lane = threadIdx.x;
     if (lane < (2 + hc) * hc) {   // the mix = the sum of its slices, in slice order
         float m = 0.f;
-        for (int q = 0; q < kMixSlices; ++q) m += part[lane * kMixSlices + q];
+        for (int q = 0; q < n_slices; ++q) m += part[lane * kPartStride + q];
         mixes[lane] = m;
     }
     __syncwarp();
@@ -773,7 +774,7 @@ inline unsigned blocks_for(int n, int t = 256) { return (unsigned) ((n + t - 1) 
 
 }  // namespace
 
-int mhc_mix_slices() { return kMixSlices; }
+int mhc_mix_slices() { return kPartStride; }
 
 void f32_gemv(const float* W, const float* x, float* y, int n_in, int n_out, void* s) {
     k_f32_gemv<<<blocks_for(n_out, 8), 256, 0, S(s)>>>(W, x, y, n_in, n_out);
@@ -790,7 +791,7 @@ void mhc_mix(const float* R, const float* fn, const float* scale, const float* b
     const int n = hc * n_embd;
     k_mhc_rs<<<1, 1024, 0, S(s)>>>(R, rs, n, eps_rms);
     k_mhc_mixes<<<dim3((2 + hc) * hc, kMixSlices), 128, 0, S(s)>>>(R, fn, rs, part, n);
-    k_mhc_nonlin<<<1, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc);
+    k_mhc_nonlin<<<1, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc, kMixSlices);
 }
 void mhc_pre_apply(const float* R, const float* pre, float* x, int n_embd, int hc, void* s) {
     k_mhc_pre_apply<<<blocks_for(n_embd), 256, 0, S(s)>>>(R, pre, x, n_embd, hc);
@@ -916,27 +917,40 @@ void dequant_q8_0_row(const uint8_t* w, int row, float* out, int n, void* s) {
 namespace {
 constexpr int kTmax = 2048;   // the window; the KDA snapshots (commit rollback) cover the first kSnapMax tokens only
 
+template <int NT>
 __global__ void k_f32_gemv_t(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y, int n_in,
                              int n_out) {
-    const int t = blockIdx.y;
+    // a warp per weight row, the row read once for the NT activation columns (the columns stay in L2; the matrix is
+    // the traffic: the router and the indexer projections are F32, 5-25 MB per layer)
     const int row = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     const int lane = threadIdx.x % WARP;
     if (row >= n_out) return;
     const float* w = W + (size_t) row * n_in;
-    const float* xt = x + (size_t) t * n_in;
-    float acc = 0.f;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
     if ((n_in & 3) == 0) {
         const float4* w4 = reinterpret_cast<const float4*>(w);
-        const float4* x4 = reinterpret_cast<const float4*>(xt);
         for (int i = lane; i < n_in / 4; i += WARP) {
-            const float4 a = w4[i], b = x4[i];
-            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            const float4 a = w4[i];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 b = reinterpret_cast<const float4*>(x + (size_t) t * n_in)[i];
+                acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
         }
     } else {
-        for (int i = lane; i < n_in; i += WARP) acc += w[i] * xt[i];
+        for (int i = lane; i < n_in; i += WARP) {
+            const float a = w[i];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[t] += a * x[(size_t) t * n_in + i];
+        }
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[(size_t) t * n_out + row] = acc;
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float v = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t) t * n_out + row] = v;
+    }
 }
 __global__ void k_layer_norm_t(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b,
                                float* __restrict__ y, int n, float eps) {
@@ -961,7 +975,9 @@ __global__ void k_mhc_rs_t(const float* __restrict__ R, float* rs, int n, float 
     ss = block_sum(ss, sh);
     if (threadIdx.x == 0) rs[blockIdx.x] = 1.0f / sqrtf(ss / n + eps);
 }
-__global__ void k_mhc_mixes_t(const float* __restrict__ R, const float* __restrict__ fn, const float* __restrict__ rs,
+// the original per-row form (grid z = the window row): T x n_mix x slices small blocks - the fastest for wide windows
+// (the fn rows stay in L2; the 8-row form below has too few blocks there)
+__global__ void k_mhc_mixes_z(const float* __restrict__ R, const float* __restrict__ fn, const float* __restrict__ rs,
                               float* __restrict__ part, int n, int n_mix) {
     const int row = blockIdx.x, slice = blockIdx.y, t = blockIdx.z;
     __shared__ float sh[32];
@@ -969,27 +985,91 @@ __global__ void k_mhc_mixes_t(const float* __restrict__ R, const float* __restri
     const float* Rt = R + (size_t) t * n;
     const int per = n / kMixSlices, i0 = slice * per;
     float acc = 0.f;
-    const float s = rs[t];
+    const float sc = rs[t];
     const float4* w4 = reinterpret_cast<const float4*>(w + i0);
     const float4* r4 = reinterpret_cast<const float4*>(Rt + i0);
     for (int i = threadIdx.x; i < per / 4; i += blockDim.x) {
         const float4 a = w4[i], b = r4[i];
-        acc += a.x * (b.x * s) + a.y * (b.y * s) + a.z * (b.z * s) + a.w * (b.w * s);
+        acc += a.x * (b.x * sc) + a.y * (b.y * sc) + a.z * (b.z * sc) + a.w * (b.w * sc);
     }
     acc = block_sum(acc, sh);
-    if (threadIdx.x == 0) part[((size_t) t * n_mix + row) * kMixSlices + slice] = acc;
+    if (threadIdx.x == 0) part[((size_t) t * n_mix + row) * kPartStride + slice] = acc;
+}
+template <int NT>
+__global__ void k_mhc_mixes_t(const float* __restrict__ R, const float* __restrict__ fn, const float* __restrict__ rs,
+                              float* __restrict__ part, int n, int n_mix) {
+    // block = (mix row, slice): the fn row slice read once, the NT residual rows (R stays in L2) dotted against it
+    const int row = blockIdx.x, slice = blockIdx.y;
+    __shared__ float sh[32];
+    const float* w = fn + (size_t) row * n;
+    const int per = n / kMixSlices, i0 = slice * per;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    const float4* w4 = reinterpret_cast<const float4*>(w + i0);
+    float sc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) sc[t] = rs[t];
+    for (int i = threadIdx.x; i < per / 4; i += blockDim.x) {
+        const float4 a = w4[i];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {   // the same products in the same order as the one-column kernel (bit-identical)
+            const float4 b = reinterpret_cast<const float4*>(R + (size_t) t * n + i0)[i];
+            acc[t] += a.x * (b.x * sc[t]) + a.y * (b.y * sc[t]) + a.z * (b.z * sc[t]) + a.w * (b.w * sc[t]);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float v = block_sum(acc[t], sh);   // (block_sum syncs before it writes sh: the previous column's read is done)
+        if (threadIdx.x == 0) part[((size_t) t * n_mix + row) * kPartStride + slice] = v;
+    }
+}
+// the wide windows' mixes as a small GEMM: block = 8 rows of R x one slice of n / 32; the fn slice (n_mix x n/32) in LDS,
+// lane k = slice start + j * 32 + lane (conflict-free LDS, coalesced R), 24 accumulators per thread, a warp reduction
+// per (row, mix); the residual rows are read from HBM once.  part[t][mix][slice] over kPartStride slices (rs applied)
+constexpr int kWideT = 16;   // rows per block: 8 warps x 2 rows each (the fn slice in LDS amortized over 16 rows)
+__global__ void __launch_bounds__(256) k_mhc_mixes_wide(const float* __restrict__ R, const float* __restrict__ fn, const float* __restrict__ rs,
+                                                         float* __restrict__ part, int n, int n_mix, int T) {
+    extern __shared__ float fn_s[];   // [n_mix][per], per = n / kPartStride (256 for n = 16384: 24 KB)
+    const int per = n / kPartStride, slice = blockIdx.y, i0 = slice * per;
+    for (int i = threadIdx.x; i < n_mix * (per / 4); i += blockDim.x) {
+        const int r = i / (per / 4), c4 = i % (per / 4);
+        reinterpret_cast<float4*>(fn_s + (size_t) r * per)[c4] = reinterpret_cast<const float4*>(fn + (size_t) r * n + i0)[c4];
+    }
+    __syncthreads();
+    const int w = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    for (int rr = 0; rr < kWideT / 8; ++rr) {
+        const int t = blockIdx.x * kWideT + w + 8 * rr;
+        if (t >= T) break;
+        const float* Rt = R + (size_t) t * n + i0;
+        float acc[24];
+#pragma unroll
+        for (int r = 0; r < 24; ++r) acc[r] = 0.f;
+        for (int k = lane; k < per; k += WARP) {
+            const float x = Rt[k];
+#pragma unroll
+            for (int r = 0; r < 24; ++r) if (r < n_mix) acc[r] += x * fn_s[(size_t) r * per + k];
+        }
+        const float sc = rs[t];
+#pragma unroll
+        for (int r = 0; r < 24; ++r) {
+            if (r >= n_mix) break;
+            const float v = warp_sum(acc[r]);
+            if (lane == 0) part[((size_t) t * n_mix + r) * kPartStride + slice] = v * sc;
+        }
+    }
 }
 __global__ void k_mhc_nonlin_t(const float* __restrict__ part, const float* __restrict__ scale,
                                const float* __restrict__ base, float* mixes, float* pre, float* post, float* comb, int hc,
-                               int iters, float eps) {
+                               int iters, float eps, int n_slices) {
     const int t = blockIdx.x;
     const int n_mix = (2 + hc) * hc;
-    const float* pt = part + (size_t) t * n_mix * kMixSlices;
+    const float* pt = part + (size_t) t * n_mix * kPartStride;
     float* mt = mixes + (size_t) t * n_mix;
     const int lane = threadIdx.x;
     if (lane < n_mix) {
         float m = 0.f;
-        for (int q = 0; q < kMixSlices; ++q) m += pt[lane * kMixSlices + q];
+        for (int q = 0; q < n_slices; ++q) m += pt[lane * kPartStride + q];
         mt[lane] = m;
     }
     __syncwarp();
@@ -1178,31 +1258,50 @@ __global__ void k_dsa_expand_b(const uint16_t* __restrict__ wv_b, const float* _
         if (lane == 0) out[((size_t) t * n_head + h) * head_v + v] = acc;
     }
 }
+template <int NT>
 __global__ void k_dsa_absorb_t(const uint16_t* __restrict__ wk_b, const float* __restrict__ q, float* __restrict__ q_abs,
                                int n_head, int kv_lora, int head_k) {
-    const int t = blockIdx.z, h = blockIdx.y;
+    // a warp per (head, latent j): the wk_b row read once for the NT window rows (16.8 MB per layer; the queries stay in L2)
+    const int h = blockIdx.y;
     const int j = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     const int lane = threadIdx.x % WARP;
     if (j >= kv_lora) return;
     const uint16_t* w = wk_b + ((size_t) h * kv_lora + j) * head_k;
-    const float* qh = q + ((size_t) t * n_head + h) * head_k;
-    float acc = 0.f;
-    for (int i = lane; i < head_k; i += WARP) acc += bf16f(w[i]) * qh[i];
-    acc = warp_sum(acc);
-    if (lane == 0) q_abs[((size_t) t * n_head + h) * kv_lora + j] = acc;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int i = lane; i < head_k; i += WARP) {
+        const float wv = bf16f(w[i]);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] += wv * q[((size_t) t * n_head + h) * head_k + i];
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float v = warp_sum(acc[t]);
+        if (lane == 0) q_abs[((size_t) t * n_head + h) * kv_lora + j] = v;
+    }
 }
+template <int NT>
 __global__ void k_dsa_expand_t(const uint16_t* __restrict__ wv_b, const float* __restrict__ ctx, float* __restrict__ out,
                                int n_head, int kv_lora, int head_v) {
-    const int t = blockIdx.z, h = blockIdx.y;
+    const int h = blockIdx.y;
     const int v = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
     const int lane = threadIdx.x % WARP;
     if (v >= head_v) return;
     const uint16_t* w = wv_b + ((size_t) h * head_v + v) * kv_lora;
-    const float* c = ctx + ((size_t) t * n_head + h) * kv_lora;
-    float acc = 0.f;
-    for (int j = lane; j < kv_lora; j += WARP) acc += bf16f(w[j]) * c[j];
-    acc = warp_sum(acc);
-    if (lane == 0) out[((size_t) t * n_head + h) * head_v + v] = acc;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int j = lane; j < kv_lora; j += WARP) {
+        const float wv = bf16f(w[j]);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] += wv * ctx[((size_t) t * n_head + h) * kv_lora + j];
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float r = warp_sum(acc[t]);
+        if (lane == 0) out[((size_t) t * n_head + h) * head_v + v] = r;
+    }
 }
 // the router over T tokens: block per token
 __global__ void k_router_t(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert, int k,
@@ -1271,7 +1370,8 @@ __global__ void k_moe_group(const int32_t* __restrict__ ids, const float* __rest
                             int* __restrict__ grp_col0, int* __restrict__ grp_ncols, int* __restrict__ grp_orow,
                             int* __restrict__ pair_tok, float* __restrict__ pair_w, int* __restrict__ cnt,
                             int* __restrict__ grp_e, int* __restrict__ grp_miss, int split_hits, int* __restrict__ bounds,
-                            int* __restrict__ tok_pairs, int n_slots, int* __restrict__ bounds_res, int* __restrict__ bounds_miss) {
+                            int* __restrict__ tok_pairs, int n_slots, int* __restrict__ bounds_res, int* __restrict__ bounds_miss, int det_n,
+                            int* __restrict__ rank_scratch) {
     // A counting sort of the T*K pairs by expert (one block, any T): the groups are the routed experts in ascending
     // id, hits before misses; a missed expert's staging slot = its rank among the missed experts (the host sorts its
     // miss list the same way).  A pair's column within its group = its arrival order (the order does not matter:
@@ -1364,10 +1464,20 @@ __global__ void k_moe_group(const int32_t* __restrict__ ids, const float* __rest
         cnt[4] = 0;
     }
     __syncthreads();
+    const bool det = n <= det_n;   // the pairs of a group in token order (the host's CPU service lays its rows out the same way)
+    if (det && n > 64 && rank_scratch) {   // a thread per expert scans the pairs once (n up to 16K): rank = the earlier pairs of the same expert
+        for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+            if (s_count[e] == 0) continue;
+            int c = 0;
+            for (int p = 0; p < n; ++p) if (ids[p] == e) rank_scratch[p] = c++;
+        }
+        __syncthreads();
+    }
     for (int p = threadIdx.x; p < n; p += blockDim.x) {
         const int e = ids[p];
         int rank;
-        if (n <= 64) {   // a decode window: the pairs of a group in token order (the host's CPU service lays its rows out the same way)
+        if (det && n > 64 && rank_scratch) rank = rank_scratch[p];
+        else if (det) {   // a decode window: a quadratic count is cheap
             rank = 0;
             for (int q = 0; q < p; ++q) rank += ids[q] == e;
         } else rank = atomicAdd(&s_fill[e], 1);
@@ -1528,7 +1638,22 @@ __global__ void k_add_rows(float* __restrict__ y, const float* __restrict__ x, i
 
 int window_max_tokens() { return kTmax; }
 void f32_gemv_t(const float* W, const float* x, float* y, int n_in, int n_out, int T, void* s) {
-    k_f32_gemv_t<<<dim3(blocks_for(n_out, 8), T), 256, 0, S(s)>>>(W, x, y, n_in, n_out);
+    for (int t0 = 0; t0 < T; t0 += 8) {   // up to 8 columns per launch, the matrix read once per launch
+        const int Tc = std::min(8, T - t0);
+        const float* xc = x + (size_t) t0 * n_in;
+        float* yc = y + (size_t) t0 * n_out;
+        const dim3 g(blocks_for(n_out, 8));
+        switch (Tc) {
+        case 1: k_f32_gemv_t<1><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 2: k_f32_gemv_t<2><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 3: k_f32_gemv_t<3><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 4: k_f32_gemv_t<4><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 5: k_f32_gemv_t<5><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 6: k_f32_gemv_t<6><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        case 7: k_f32_gemv_t<7><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        default: k_f32_gemv_t<8><<<g, 256, 0, S(s)>>>(W, xc, yc, n_in, n_out); break;
+        }
+    }
 }
 void layer_norm_t(const float* x, const float* w, const float* b, float* y, int rows, int n, float eps, void* s) {
     k_layer_norm_t<<<rows, 128, 0, S(s)>>>(x, w, b, y, n, eps);
@@ -1537,8 +1662,48 @@ void mhc_mix_t(const float* R, const float* fn, const float* scale, const float*
                float* pre, float* post, float* comb, int T, int n_embd, int hc, int iters, float eps_rms, float eps_hc, void* s) {
     const int n = hc * n_embd, n_mix = (2 + hc) * hc;
     k_mhc_rs_t<<<T, 1024, 0, S(s)>>>(R, rs, n, eps_rms);
-    k_mhc_mixes_t<<<dim3(n_mix, kMixSlices, T), 128, 0, S(s)>>>(R, fn, rs, part, n, n_mix);
-    k_mhc_nonlin_t<<<T, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc);
+    static const int kWide = std::getenv("STRATA_GLM5_MHC_WIDE") ? std::atoi(std::getenv("STRATA_GLM5_MHC_WIDE")) : 0;   // 1: the GEMM-style kernel for wide windows (no faster than the per-row one: off); 2: both, the mixes compared (debug)
+    if (kWide && T >= 16 && n_mix <= 24 && n % (kPartStride * 4 * WARP) == 0) {   // a prompt window: the GEMM-style kernel
+        const size_t smem = (size_t) n_mix * (n / kPartStride) * sizeof(float);
+        k_mhc_mixes_wide<<<dim3((T + kWideT - 1) / kWideT, kPartStride), 256, smem, S(s)>>>(R, fn, rs, part, n, n_mix, T);
+        k_mhc_nonlin_t<<<T, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc, kPartStride);
+        if (kWide == 2) {
+            std::vector<float> a((size_t) T * n_mix), b((size_t) T * n_mix);
+            cudaStreamSynchronize(S(s));
+            cudaMemcpy(a.data(), mixes, a.size() * 4, cudaMemcpyDeviceToHost);
+            k_mhc_mixes_z<<<dim3(n_mix, kMixSlices, T), 128, 0, S(s)>>>(R, fn, rs, part, n, n_mix);
+            k_mhc_nonlin_t<<<T, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc, kMixSlices);
+            cudaStreamSynchronize(S(s));
+            cudaMemcpy(b.data(), mixes, b.size() * 4, cudaMemcpyDeviceToHost);
+            double md = 0, mv = 0; size_t at = 0;
+            for (size_t i = 0; i < a.size(); ++i) { const double d = std::fabs((double) a[i] - b[i]); if (d > md) { md = d; at = i; } mv = std::max(mv, (double) std::fabs(b[i])); }
+            std::fprintf(stderr, "glm5: mhc wide vs exact: T %d max |diff| %.3e at (t %zu, mix %zu) (max |exact| %.3e)\n", T, md, at / n_mix, at % n_mix, mv);
+        }
+        return;
+    }
+    if (T >= 16) {   // a prompt window on the exact kernel: the per-row grid
+        k_mhc_mixes_z<<<dim3(n_mix, kMixSlices, T), 128, 0, S(s)>>>(R, fn, rs, part, n, n_mix);
+        k_mhc_nonlin_t<<<T, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc, kMixSlices);
+        return;
+    }
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int Tc = std::min(8, T - t0);
+        const float* Rt = R + (size_t) t0 * n;
+        float* pt = part + (size_t) t0 * n_mix * kPartStride;
+        const float* rst = rs + t0;
+        const dim3 g(n_mix, kMixSlices);
+        switch (Tc) {
+        case 1: k_mhc_mixes_t<1><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 2: k_mhc_mixes_t<2><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 3: k_mhc_mixes_t<3><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 4: k_mhc_mixes_t<4><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 5: k_mhc_mixes_t<5><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 6: k_mhc_mixes_t<6><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        case 7: k_mhc_mixes_t<7><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        default: k_mhc_mixes_t<8><<<g, 128, 0, S(s)>>>(Rt, fn, rst, pt, n, n_mix); break;
+        }
+    }
+    k_mhc_nonlin_t<<<T, 32, 0, S(s)>>>(part, scale, base, mixes, pre, post, comb, hc, iters, eps_hc, kMixSlices);
 }
 void mhc_pre_apply_t(const float* R, const float* pre, float* x, int T, int n_embd, int hc, void* s) {
     k_mhc_pre_apply_t<<<dim3(blocks_for(n_embd), T), 256, 0, S(s)>>>(R, pre, x, n_embd, hc);
@@ -1600,11 +1765,41 @@ void kda_step_t(float* state, const float* q, const float* k, const float* v, co
 }
 void dsa_absorb_t(const uint16_t* wk_b, const float* q, float* q_abs, int T, int n_head, int kv_lora, int head_k, void* s) {
     if (T >= 16 && head_k <= 256) k_dsa_absorb_b<<<dim3(blocks_for(kv_lora, 8), n_head), 256, 0, S(s)>>>(wk_b, q, q_abs, n_head, kv_lora, head_k, T);
-    else k_dsa_absorb_t<<<dim3(blocks_for(kv_lora, 8), n_head, T), 256, 0, S(s)>>>(wk_b, q, q_abs, n_head, kv_lora, head_k);
+    else for (int t0 = 0; t0 < T; t0 += 8) {   // up to 8 rows per launch, the matrix read once per launch
+        const int Tc = std::min(8, T - t0);
+        const float* qt = q + (size_t) t0 * n_head * head_k;
+        float* ot = q_abs + (size_t) t0 * n_head * kv_lora;
+        const dim3 g(blocks_for(kv_lora, 8), n_head);
+        switch (Tc) {
+        case 1: k_dsa_absorb_t<1><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 2: k_dsa_absorb_t<2><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 3: k_dsa_absorb_t<3><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 4: k_dsa_absorb_t<4><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 5: k_dsa_absorb_t<5><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 6: k_dsa_absorb_t<6><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        case 7: k_dsa_absorb_t<7><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        default: k_dsa_absorb_t<8><<<g, 256, 0, S(s)>>>(wk_b, qt, ot, n_head, kv_lora, head_k); break;
+        }
+    }
 }
 void dsa_expand_t(const uint16_t* wv_b, const float* ctx, float* out, int T, int n_head, int kv_lora, int head_v, void* s) {
     if (T >= 16 && kv_lora <= 512) k_dsa_expand_b<<<dim3(blocks_for(head_v, 8), n_head), 256, 0, S(s)>>>(wv_b, ctx, out, n_head, kv_lora, head_v, T);
-    else k_dsa_expand_t<<<dim3(blocks_for(head_v, 8), n_head, T), 256, 0, S(s)>>>(wv_b, ctx, out, n_head, kv_lora, head_v);
+    else for (int t0 = 0; t0 < T; t0 += 8) {
+        const int Tc = std::min(8, T - t0);
+        const float* ct = ctx + (size_t) t0 * n_head * kv_lora;
+        float* ot = out + (size_t) t0 * n_head * head_v;
+        const dim3 g(blocks_for(head_v, 8), n_head);
+        switch (Tc) {
+        case 1: k_dsa_expand_t<1><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 2: k_dsa_expand_t<2><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 3: k_dsa_expand_t<3><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 4: k_dsa_expand_t<4><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 5: k_dsa_expand_t<5><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 6: k_dsa_expand_t<6><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        case 7: k_dsa_expand_t<7><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        default: k_dsa_expand_t<8><<<g, 256, 0, S(s)>>>(wv_b, ct, ot, n_head, kv_lora, head_v); break;
+        }
+    }
 }
 void router_sigmoid_topk_t(const float* logits, const float* bias, int T, int n_expert, int k, bool norm, float scale, int32_t* ids,
                            float* weights, float* probs, void* s) {
@@ -1634,11 +1829,11 @@ void moe_group(const int32_t* ids, const float* wts, int T, int K, int n_expert,
                uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const uint8_t* const* loan_ptr, const void** grp_w,
                const void** grp_wu, const void** grp_wd, int* grp_col0, int* grp_ncols, int* grp_orow, int* pair_tok,
                float* pair_w, int* cnt, int* grp_e, int* grp_miss, bool split_hits, int* bounds, int* tok_pairs, int n_slots, int* bounds_res,
-               int* bounds_miss, void* s) {
+               int* bounds_miss, void* s, int det_n, int* rank_scratch) {
     if (n_expert > 512) throw std::runtime_error("moe_group: more than 512 experts");
     k_moe_group<<<1, 1024, 0, S(s)>>>(ids, wts, T, K, n_expert, slot_of, slots, blob, gate_bytes, up_bytes, stage, stage_bytes, loan_ptr, grp_w, grp_wu,
                                       grp_wd, grp_col0, grp_ncols, grp_orow, pair_tok, pair_w, cnt, grp_e, grp_miss, split_hits ? 1 : 0, bounds, tok_pairs,
-                                      n_slots, bounds_res, bounds_miss);
+                                      n_slots, bounds_res, bounds_miss, det_n, rank_scratch);
 }
 void moe_gather_experts(const void* const* grp_w, const int* grp_e, const int* grp_miss, const int* n_groups, int n_expert, uint64_t blob,
                         uint8_t* dst, uint64_t stride, void* s) {
@@ -1646,6 +1841,17 @@ void moe_gather_experts(const void* const* grp_w, const int* grp_e, const int* g
 }
 void moe_cpu_mask(const int* cnt, const int* grp_miss, const int* miss_cpu, int* grp_ncols, void* s) {
     k_moe_cpu_mask<<<1, 256, 0, S(s)>>>(cnt, grp_miss, miss_cpu, grp_ncols);
+}
+__global__ void k_swiglu_clamp_gu_t(const float* __restrict__ gu, float* __restrict__ h, int n, float limit) {
+    const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = gu[(size_t) r * 2 * n + i], uu = gu[(size_t) r * 2 * n + n + i];
+    const size_t o = (size_t) r * n + i;
+    if (limit > 0.f) h[o] = siluf_(fminf(g, limit)) * fminf(fmaxf(uu, -limit), limit);
+    else h[o] = siluf_(g) * uu;
+}
+void swiglu_clamp_gu_t(const float* gu, float* h, int T, int n, float limit, void* s) {
+    k_swiglu_clamp_gu_t<<<dim3(blocks_for(n), T), 256, 0, S(s)>>>(gu, h, n, limit);
 }
 void swiglu_clamp_gu(const float* gu, float* h, const int* n_rows, int max_rows, int n, float limit, void* s) {
     k_swiglu_clamp_gu<<<dim3(blocks_for(n), max_rows), 256, 0, S(s)>>>(gu, h, n_rows, n, limit);

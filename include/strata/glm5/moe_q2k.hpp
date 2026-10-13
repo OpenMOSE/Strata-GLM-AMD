@@ -16,7 +16,9 @@ void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* c
 /// dst[(bounds[e] + c) * ld_dst + r] = w_e[r] . act[bounds[e] + c] for expert e in [0, n), its columns [bounds[e], bounds[e+1]),
 /// its matrix at w + e * expert_bytes + mat_off ([n_rows][K] Q2_K, row pitch K/256*84 bytes).  max_cols bounds the grid.
 void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K, const int32_t* bounds, int n, int max_cols,
-             const int8_t* codes, const float* scales, const int32_t* sums, float* dst, int ld_dst, void* stream);
+             const int8_t* codes, const float* scales, const int32_t* packed, float* dst, int ld_dst, void* stream, const int32_t* skip = nullptr);
+///< packed: the activation sums packed per (column, super-block) by pack_sums
+///< skip: per expert e (nullable), nonzero = its columns are computed elsewhere (the CPU); the kernel leaves them
 
 /// The decode path (a window of at most 8 rows): the Q8_1 columns of the window (the grouped MMVQ's operand, pitch
 /// (K/32)*36 bytes) unpacked once into int8 codes [cols][K], per-32 scales d8 [cols][K/32] and per-16 sums [cols][K/16].

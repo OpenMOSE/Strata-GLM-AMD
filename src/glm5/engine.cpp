@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <numeric>
 #include <type_traits>
 #include <vector>
@@ -42,6 +43,8 @@ inline size_t q8_cols(int n) { return strata::kernels::native_q8_1_bytes(n, 1); 
 const bool kDebugSync = std::getenv("STRATA_GLM5_SYNC") != nullptr;   // synchronise after every layer and name a fault
 const bool kNoDoorbell = std::getenv("STRATA_GLM5_NODOORBELL") != nullptr;   // stage the misses synchronously instead
 const bool kTrace = std::getenv("STRATA_GLM5_TRACE") != nullptr;
+const bool kMidCpu = !(std::getenv("STRATA_GLM5_MID_CPU") && std::atoi(std::getenv("STRATA_GLM5_MID_CPU")) == 0);   // mid-size prompt windows: the misses split between PCIe and the CPU
+constexpr int kDbXRows = 2048;   // MoE input rows published for the CPU service (a mid-size window's tokens, two blocks by layer parity)
 const bool kNoDecQ2K = std::getenv("STRATA_GLM5_NODECQ2K") && std::atoi(std::getenv("STRATA_GLM5_NODECQ2K")) != 0;   // the decode Q2_K products back on the grouped MMVQ
 const bool kProf = std::getenv("STRATA_GLM5_PROF") != nullptr;   // per-phase GPU times of every window
 constexpr int kDsaBatch = 64;    // tokens per DSA score / select / attend launch
@@ -248,6 +251,11 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
             if (!g->init(d.stream, (int64_t) big * E, err)) throw std::runtime_error("glm5: prefill gemm: " + err);
             d.gemm = g;
             d.x16 = static_cast<uint16_t*>(alloc((uint64_t) T * big * 2, ordinal));
+            // the BLAS library's first call costs ~170 ms (its kernel library loads): paid here, not by the first request
+            check(cudaMemsetAsync(d.x16, 0, 64 * 64 * 2 * 2, S(d.stream)), "warm-up memset");
+            g->bf16(d.x16, d.x16 + 64 * 64, d.big_a, 16, 64, 64);
+            g->f16(d.x16, d.x16 + 64 * 64, d.big_a, 16, 64, 64);
+            check(cudaStreamSynchronize(S(d.stream)), "warm-up sync");
         }
         if (T >= kMmqMinT && !kNoMmq && strata::prefill::mmq::built()) {
             // the MMQ expert path: the window's experts gathered into [n_expert] contiguous slots (the widest layer's sizes)
@@ -271,7 +279,7 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
                     d.q2k_scales = f((uint64_t) pairs_alloc_ * (E / 256));
                     d.q2k_sums = static_cast<int32_t*>(alloc((uint64_t) pairs_alloc_ * (E / 16) * 4, ordinal));
                     // the decode windows (at most 64 pairs) on the same kernel family: packed sums, and the swiglu rows' operands
-                    d.q2k_packed = static_cast<int32_t*>(alloc((uint64_t) 64 * (E / 256) * 8 * 4, ordinal));
+                    d.q2k_packed = static_cast<int32_t*>(alloc((uint64_t) pairs_alloc_ * (E / 256) * 8 * 4, ordinal));   // (E/256 >= FF/256: the down product's fit too)
                     d.dec_codes_h = static_cast<int8_t*>(alloc((uint64_t) 64 * FF, ordinal));
                     d.dec_scales_h = f((uint64_t) 64 * (FF / 256));
                     d.dec_sums_h = static_cast<int32_t*>(alloc((uint64_t) 64 * (FF / 16) * 4, ordinal));
@@ -324,7 +332,9 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
             d.db_pub_h = static_cast<uint32_t*>(alloc_mapped((uint64_t) NL * 4, ordinal, &dv)); d.db_pub_d = static_cast<uint32_t*>(dv);
             d.db_flag_h = static_cast<uint32_t*>(alloc_mapped((uint64_t) NL * 4, ordinal, &dv)); d.db_flag_d = static_cast<uint32_t*>(dv);
             d.tok_dev = static_cast<uint32_t*>(alloc(4, ordinal));
-            d.db_x_h = static_cast<float*>(alloc_mapped((uint64_t) NL * 8 * E * 4, ordinal, &dv)); d.db_x_d = static_cast<float*>(dv);
+            d.db_x_h = static_cast<float*>(alloc_mapped((uint64_t) 2 * kDbXRows * E * 4, ordinal, &dv)); d.db_x_d = static_cast<float*>(dv);
+            d.pair_rank = static_cast<int*>(alloc((uint64_t) pairs_alloc_ * 4, ordinal));
+            d.cpu_skip_h = static_cast<int32_t*>(alloc_mapped((uint64_t) NL * hp_.n_expert * 4, ordinal, &dv)); d.cpu_skip_d = static_cast<int32_t*>(dv);
             d.miss_cpu_h = static_cast<int*>(alloc_mapped((uint64_t) NL * 64 * 4, ordinal, &dv)); d.miss_cpu_d = static_cast<int*>(dv);
             d.db_flag2_h = static_cast<uint32_t*>(alloc_mapped((uint64_t) NL * 4, ordinal, &dv)); d.db_flag2_d = static_cast<uint32_t*>(dv);
             d.miss_slot_h = static_cast<int*>(alloc_mapped((uint64_t) NL * T * K * 4, ordinal, &dv)); d.miss_slot_d = static_cast<int*>(dv);
@@ -1150,6 +1160,11 @@ bool Engine::serve_step() {
             const int k = ring_buf(d, *d.job, il);
             const int di = experts_->device_index_of_layer(il);
             void* wait_ev = ring_wait_event(d, k, *d.job);
+            if (mid_split_)
+                nm = experts_->serve_mid(il, d.db_ids_h + (size_t) il * t_chunk_ * K, T * K, T, d.db_x_h + (size_t) (il & 1) * kDbXRows * hp_.n_embd, jtok(d),
+                                         d.db_flag_h + il, d.db_flag_d + il, d.db_flag2_h + il, d.db_flag2_d + il, d.ffn_y, hp_.n_embd,
+                                         d.cpu_skip_h + (size_t) il * hp_.n_expert, experts_->win_buf(di, k), experts_->layer(il).stride, wait_ev);
+            else
             nm = experts_->serve_ring(il, d.db_ids_h + (size_t) il * t_chunk_ * K, T * K, jtok(d), d.db_flag_h + il, d.db_flag_d + il, experts_->win_buf(di, k),
                                       experts_->layer(il).stride, wait_ev);
             d.ring_user[(size_t) k] = il;
@@ -1160,7 +1175,7 @@ bool Engine::serve_step() {
         return true;
     }
     const int nm = (cpu_mode_ && !all_resident)
-        ? experts_->serve_cpu(il, d.db_ids_h + (size_t) il * t_chunk_ * K, T * K, T, d.db_x_h + (size_t) il * 8 * hp_.n_embd, jtok(d), d.db_flag_h + il, d.db_flag_d + il,
+        ? experts_->serve_cpu(il, d.db_ids_h + (size_t) il * t_chunk_ * K, T * K, T, d.db_x_h + (size_t) (il & 1) * kDbXRows * hp_.n_embd, jtok(d), d.db_flag_h + il, d.db_flag_d + il,
                               d.db_flag2_h + il, d.db_flag2_d + il, d.ffn_y, hp_.n_embd, d.miss_cpu_h + (size_t) il * 64,
                               d.miss_slot_h + (size_t) il * t_chunk_ * K, d.miss_out_h + (size_t) il * t_chunk_ * K, swaps_now_)
         : experts_->serve(il, d.db_ids_h + (size_t) il * t_chunk_ * K, T * K, jtok(d), d.db_flag_h + il, d.db_flag_d + il, d.miss_slot_h + (size_t) il * t_chunk_ * K,
@@ -1169,6 +1184,19 @@ bool Engine::serve_step() {
     if (predicts_next(il) && !prompt_mode_) prefetch_from(il);
     pending_.store(il + 1, std::memory_order_release);
     return true;
+}
+
+// after a doorbell failure: every layer's flags set to the token the device waits for, so a kernel parked in moe_wait
+// returns (the rows it then reads are garbage; the host thread throws db_err_ at its next synchronization)
+void Engine::release_waits() {
+    for (auto& d : devs_) {
+        if (!d.db_flag_h) continue;
+        const uint32_t t = d.job ? d.job->tok : tok_;
+        for (int il = 0; il < hp_.n_layer; ++il) {
+            __atomic_store_n(d.db_flag_h + il, t, __ATOMIC_RELEASE);
+            if (d.db_flag2_h) __atomic_store_n(d.db_flag2_h + il, t, __ATOMIC_RELEASE);
+        }
+    }
 }
 
 void Engine::db_main() {
@@ -1189,6 +1217,7 @@ void Engine::db_main() {
             std::fprintf(stderr, "glm5: doorbell thread: %s\n", e.what());
             db_failed_.store(true, std::memory_order_release);
             db_active_.store(false, std::memory_order_release);
+            release_waits();   // the device's parked waits open (their data is garbage); the host thread sees db_failed_ at its next sync and throws
             continue;
         }
         if (progressed) { idle = false; continue; }
@@ -1213,6 +1242,7 @@ void Engine::db_main() {
                       std::to_string(d.db_pub_h[il]) + ")";
             db_failed_.store(true, std::memory_order_release);
             db_active_.store(false, std::memory_order_release);
+            release_waits();
         }
     }
 }
@@ -1277,9 +1307,10 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     if (doorbell && !prompt_mode_ && predicts_next(il)) predict_next(d, il, T, xn);
     const bool all_resident = experts_ && experts_->layer(il).n_slots == hp_.n_expert;
     const bool cpu = cpu_mode_ && doorbell && !all_resident;
+    const bool xrows = cpu || (mid_split_ && doorbell && !all_resident);   // the CPU service reads the MoE inputs
     if (doorbell && (!prompt_mode_ || mid_mode_))
-        moe_publish(d.ids, T * K, d.tok_dev, d.db_ids_d + (size_t) il * t_chunk_ * K, d.db_pub_d + il, cpu ? xn : nullptr, cpu ? T * E : 0,
-                    d.db_x_d + (size_t) il * 8 * E, d.stream);
+        moe_publish(d.ids, T * K, d.tok_dev, d.db_ids_d + (size_t) il * t_chunk_ * K, d.db_pub_d + il, xrows ? xn : nullptr, xrows ? T * E : 0,
+                    d.db_x_d + (size_t) (il & 1) * kDbXRows * E, d.stream);
     if (T >= kMmqMinT && d.mmq && (prompt_mode_ || all_resident)) {
         moe_mmq(d, il, T, xn, out, doorbell, slot_of, slots, blob, stage, stage_bytes, all_resident, dump, last_chunk);
         return;
@@ -1366,9 +1397,14 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     prof_mark(d, "moe_down");
     if (dump) dump("ffn_moe_out", d.ffn_acc, {E}, false, dv);
     const int SF = FF * std::max(1, hp_.n_expert_shared);
+    if (L.sh_gu.present()) {   // gate|up as one product (one launch, twice the rows per launch)
+        gemv(d, T, L.sh_gu, xn, d.ffn_g, E, 2 * SF);
+        swiglu_clamp_gu_t(d.ffn_g, d.ffn_h, T, SF, hp_.clamp_shexp[(size_t) il], d.stream);
+    } else {
     gemv(d, T, L.sh_gate, xn, d.ffn_g, E, SF);
     gemv(d, T, L.sh_up, xn, d.ffn_u, E, SF);
     swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * SF, hp_.clamp_shexp[(size_t) il], d.stream);
+    }
     gemv(d, T, L.sh_down, d.ffn_h, d.ffn_d, SF, E);
     if (dump) dump("ffn_shexp", d.ffn_d, {E}, false, dv);
     add_rows(d.ffn_acc, d.ffn_d, T * E, d.stream);
@@ -1476,13 +1512,13 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     const auto th1 = std::chrono::steady_clock::now();
     moe_group(d.ids, d.wts, T, K, hp_.n_expert, slot_of, slots, blob, L.exp_gate.stride, L.exp_up.stride, buf, blob, nullptr, d.grp_w, d.grp_wu,
               d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, d.pair_tok, d.pair_w, d.cnt, d.grp_e, d.grp_miss, false, nullptr, d.tok_pairs, n_slots,
-              d.bounds_res, d.bounds_miss, d.stream);
+              d.bounds_res, d.bounds_miss, d.stream, mid_split_ ? 1 << 20 : 64, d.pair_rank);
     if (kDebugSync) debug_sync(d.stream, il, "group");
     // the activations of every pair, quantized for MMQ (row p = token pair_tok[p]); the stale rows past cnt[2] are harmless
     const bool q2k = d.q2k_codes && L.exp_gate.type == 10 && L.exp_up.type == 10 && L.exp_down.type == 10 && (2 * FF) % 128 == 0 && E % 256 == 0 && FF % 256 == 0;
     static bool noted = false;
     if (!noted) { noted = true; std::fprintf(stderr, "glm5: prompt experts: layer %d %s (types %u/%u/%u)\n", il, q2k ? "Q2_K on WMMA" : "MMQ", L.exp_gate.type, L.exp_up.type, L.exp_down.type); }
-    if (q2k) strata::glm5::q2k::quantize_act(xn, d.pair_tok, max_pairs_, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream);
+    if (q2k) { strata::glm5::q2k::quantize_act(xn, d.pair_tok, max_pairs_, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, max_pairs_, E, d.q2k_packed, d.stream); }
     else mmq::quantize(xn, d.pair_tok, d.mmq_xq, (int) L.exp_gate.type, E, E, pairs_alloc_, d.stream);
     prof_mark(d, "router+group");
     // the non-resident experts arrive by the prefetch (its flag); the resident ones are read in place in the slot buffer
@@ -1492,6 +1528,7 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     const auto th2 = std::chrono::steady_clock::now();
     check(cudaMemcpyAsync(d.cnt_host, d.cnt + 5, 4, cudaMemcpyDeviceToHost, s), "cnt d2h");
     check(cudaStreamSynchronize(s), "cnt sync");
+    if (doorbell_ && db_failed_.load(std::memory_order_acquire)) throw std::runtime_error(db_err_);
     const auto th3 = std::chrono::steady_clock::now();
     const int max_rows = std::max(1, *d.cnt_host);
     if (kDebugSync) {
@@ -1512,10 +1549,11 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     gu.xq = d.mmq_xq; gu.bounds = d.bounds_res; gu.ids = d.iota; gu.total_rows = pairs_alloc_; gu.max_rows = max_rows; gu.ncols_opt = tile_for((int) L.exp_gate.type); gu.dst = d.gu_out; gu.ld_dst = 2 * FF;
     if (kDebugSync) std::fprintf(stderr, "glm5: layer %d product A: w %p type %d rows %lld cols %lld stride %zu n %d total_rows %lld max_rows %lld opt %lld dst %p ld %lld\n", il, gu.w, gu.type,
                                  (long long) gu.w_rows, (long long) gu.w_cols, gu.expert_bytes, gu.n, (long long) gu.total_rows, (long long) gu.max_rows, (long long) gu.ncols_opt, (void*) gu.dst, (long long) gu.ld_dst);
+    const int32_t* skip = mid_split_ ? d.cpu_skip_d + (size_t) il * hp_.n_expert : nullptr;   // the CPU-served experts of this window
     if (q2k) {
         namespace q = strata::glm5::q2k;
-        if (n_slots > 0) q::experts(slots, blob, 0, 2 * FF, E, d.bounds_res, n_slots, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.gu_out, 2 * FF, d.stream);
-        if (n_nonres > 0) q::experts(buf, blob, 0, 2 * FF, E, d.bounds_miss, n_nonres, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.gu_out, 2 * FF, d.stream);
+        if (n_slots > 0) q::experts(slots, blob, 0, 2 * FF, E, d.bounds_res, n_slots, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.gu_out, 2 * FF, d.stream);
+        if (n_nonres > 0) q::experts(buf, blob, 0, 2 * FF, E, d.bounds_miss, n_nonres, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.gu_out, 2 * FF, d.stream, skip);
     } else {
     if (n_slots > 0) ctx->run(gu, d.stream);
     if (kDebugSync) { debug_sync(d.stream, il, "mmq gate|up A"); debug_nan(d.gu_out, std::min(max_pairs_, 64), 2 * FF, il, "gate|up rows"); }
@@ -1526,7 +1564,7 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     prof_mark(d, "moe_hits");
     swiglu_clamp_gu(d.gu_out, d.ffn_h, d.cnt + 2, max_pairs_, FF, hp_.clamp_exp[(size_t) il], d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "swiglu");
-    if (q2k) strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, max_pairs_, FF, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream);
+    if (q2k) { strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, max_pairs_, FF, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream); strata::glm5::q2k::pack_sums(d.q2k_sums, max_pairs_, FF, d.q2k_packed, d.stream); }
     else mmq::quantize(d.ffn_h, nullptr, d.mmq_xq_h, (int) L.exp_down.type, FF, FF, pairs_alloc_, d.stream);
     if (kDebugSync) debug_sync(d.stream, il, "quantize h");
     mmq::Product dn;
@@ -1535,14 +1573,15 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     if (q2k) {
         namespace q = strata::glm5::q2k;
         const uint64_t off = L.exp_gate.stride + L.exp_up.stride;
-        if (n_slots > 0) q::experts(slots, blob, off, E, FF, d.bounds_res, n_slots, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.ffn_y, E, d.stream);
-        if (n_nonres > 0) q::experts(buf, blob, off, E, FF, d.bounds_miss, n_nonres, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.ffn_y, E, d.stream);
+        if (n_slots > 0) q::experts(slots, blob, off, E, FF, d.bounds_res, n_slots, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_y, E, d.stream);
+        if (n_nonres > 0) q::experts(buf, blob, off, E, FF, d.bounds_miss, n_nonres, max_rows, d.q2k_codes, d.q2k_scales, d.q2k_packed, d.ffn_y, E, d.stream, skip);
     } else {
     if (n_slots > 0) ctx->run(dn, d.stream);
     if (kDebugSync) { debug_sync(d.stream, il, "mmq down A"); debug_nan(d.ffn_y, std::min(max_pairs_, 64), E, il, "down rows"); }
     if (n_nonres > 0) { mmq::Product d2 = dn; d2.w = buf + L.exp_gate.stride + L.exp_up.stride; d2.n = n_nonres; d2.bounds = d.bounds_miss; ctx->run(d2, d.stream); }
     }
     if (kDebugSync) debug_sync(d.stream, il, "mmq down");
+    if (mid_split_ && !all_resident) moe_wait(d.db_flag2_d + il, d.tok_dev, d.stream);   // the CPU's rows for its experts are in ffn_y
     combine_tok(d.ffn_y, d.pair_w, d.tok_pairs, K, d.ffn_acc, T, E, d.stream);
     // this ring buffer's last reader: the layer nbuf ahead on this device prefetches into it after this event
     if (buf && last_chunk) {   // this ring buffer's last reader (the window's last chunk of this layer)
@@ -1558,9 +1597,14 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     prof_mark(d, "moe_down");
     if (dump) dump("ffn_moe_out", d.ffn_acc, {E}, false, d.ordinal);
     const int SF = FF * std::max(1, hp_.n_expert_shared);
+    if (L.sh_gu.present()) {   // gate|up as one product (one launch, twice the rows per launch)
+        gemv(d, T, L.sh_gu, xn, d.ffn_g, E, 2 * SF);
+        swiglu_clamp_gu_t(d.ffn_g, d.ffn_h, T, SF, hp_.clamp_shexp[(size_t) il], d.stream);
+    } else {
     gemv(d, T, L.sh_gate, xn, d.ffn_g, E, SF);
     gemv(d, T, L.sh_up, xn, d.ffn_u, E, SF);
     swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * SF, hp_.clamp_shexp[(size_t) il], d.stream);
+    }
     gemv(d, T, L.sh_down, d.ffn_h, d.ffn_d, SF, E);
     add_rows(d.ffn_acc, d.ffn_d, T * E, d.stream);
     check(cudaMemcpyAsync(out, d.ffn_acc, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s), "ffn out");
@@ -1645,7 +1689,13 @@ void Engine::forward_window_impl(const int32_t* tokens, int T, const DumpFn& dum
     // into alternating buffers (no routing-driven serving, the doorbell thread stays idle); the flags still gate
     // each layer on its prefetch
     prompt_mode_ = doorbell_ && T >= kMmqMinT && devs_[0].mmq && experts_->win_bufs() > 0;
-    mid_mode_ = prompt_mode_ && T < kPrefetchAllMinT;
+    // the mid-size window: the misses served per layer by routing (the ring filled by the doorbell), with the CPU taking
+    // its share when the split is on; else windows from kPrefetchAllMinT prefetch every non-resident expert ahead
+    const bool split_ok = kMidCpu && cpu_misses_ && experts_ && experts_->cpu_ready() && devs_[0].q2k_codes != nullptr;
+    // the split pays while the CPU's share is worth the lost prefetch-ahead: 430 tokens 3.35 -> 2.58 s, 1064 tokens 3.42 -> 3.76 s
+    static const int kMidMaxT = std::getenv("STRATA_GLM5_MID_MAX_T") ? std::atoi(std::getenv("STRATA_GLM5_MID_MAX_T")) : 640;
+    mid_mode_ = prompt_mode_ && (T < kPrefetchAllMinT || (split_ok && T <= std::min({kDbXRows, t_chunk_, kMidMaxT})));
+    mid_split_ = mid_mode_ && split_ok && T <= kDbXRows;
     if (prompt_mode_ && experts_ && experts_->loans_on()) drop_loans();   // the ring is the prompt path's again
     cpu_mode_ = doorbell_ && !prompt_mode_ && T <= 8 && cpu_misses_ && experts_->cpu_ready();
     if (!prompt_mode_ && kNoDoorbell) doorbell_ = false;
@@ -1863,7 +1913,7 @@ void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, c
     // every window a prompt window on the ring; the stages run them as a pipeline
     if (db_failed_.load(std::memory_order_acquire)) throw std::runtime_error(db_err_);
     if (experts_ && experts_->loans_on()) drop_loans();
-    rows_mode_ = false; swaps_now_ = 0; doorbell_ = true; prompt_mode_ = true; mid_mode_ = false; cpu_mode_ = false;
+    rows_mode_ = false; swaps_now_ = 0; doorbell_ = true; prompt_mode_ = true; mid_mode_ = false; mid_split_ = false; cpu_mode_ = false;
     db_active_.store(false, std::memory_order_release);
     std::vector<std::unique_ptr<Job>> jobs;
     int idx = 0;

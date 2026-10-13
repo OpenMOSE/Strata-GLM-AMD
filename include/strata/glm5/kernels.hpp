@@ -139,7 +139,7 @@ void moe_group(const int32_t* ids, const float* wts, int T, int K, int n_expert,
                uint64_t gate_bytes, uint64_t up_bytes, const uint8_t* stage, uint64_t stage_bytes, const uint8_t* const* loan_ptr, const void** grp_w,
                const void** grp_wu, const void** grp_wd, int* grp_col0, int* grp_ncols, int* grp_orow, int* pair_tok,
                float* pair_w, int* cnt, int* grp_e, int* grp_miss, bool split_hits, int* bounds, int* tok_pairs, int n_slots, int* bounds_res,
-               int* bounds_miss, void* stream);   ///< !split_hits: residents in slot order (bounds_res[n_slots+1]), then the non-resident by rank (bounds_miss)
+               int* bounds_miss, void* stream, int det_n = 64, int* rank_scratch = nullptr);   ///< det_n: a group's pairs in token order when T*K <= det_n (else arrival order); rank_scratch [T*K] for T*K > 64   ///< !split_hits: residents in slot order (bounds_res[n_slots+1]), then the non-resident by rank (bounds_miss)
 /// out[t] = sum over the token's K pairs (tok_pairs[t*K+k] = pair row) of pair_w * y[row]
 void combine_tok(const float* y, const float* pair_w, const int* tok_pairs, int K, float* out, int T, int n, void* stream);
 /// The prompt windows' dense DSA attention: the latent cache rows (and their transpose) as Q8_0 blocks, the selection
@@ -200,6 +200,7 @@ void moe_gather_experts(const void* const* grp_w, const int* grp_e, const int* g
 void moe_cpu_mask(const int* cnt, const int* grp_miss, const int* miss_cpu, int* grp_ncols, void* stream);
 /// h[r] = swiglu_clamp(gu[r][0..n), gu[r][n..2n)) for the first *n_rows rows
 void swiglu_clamp_gu(const float* gu, float* h, const int* n_rows, int max_rows, int n, float limit, void* stream);
+void swiglu_clamp_gu_t(const float* gu, float* h, int T, int n, float limit, void* stream);   ///< h[t][i] = swiglu(gu[t][i], gu[t][n + i]) for T rows
 /// After the misses were served: miss m lives in slot miss_slot[m] (< 0: staging slot m); repoint the miss groups and
 /// update the device slot table (miss_out[m] is the evicted expert or -1).  Runs after moe_wait / join.
 void moe_place(const int* cnt, const int* grp_miss, const int* grp_e, const int* miss_slot, const int* miss_out, const uint8_t* slots,

@@ -87,6 +87,7 @@ struct LayerWeights {
     // FFN
     DevTensor ffn_gate, ffn_up, ffn_down;                     // the dense layers
     DevTensor gate_inp, exp_probs_b, sh_gate, sh_up, sh_down; // the MoE layers
+    DevTensor sh_gu;                   ///< sh_gate and sh_up as one [2 SF][E] matrix (one product, one launch)
     ExpertTensor exp_gate, exp_up, exp_down;
     // the MTP (NextN) layer only
     DevTensor eh_proj, enorm, hnorm, shared_head_norm;
@@ -125,6 +126,7 @@ public:
 private:
     void init(const std::string& any_shard, bool verbose);
     DevTensor upload(const strata::GgufModel& g, const std::string& name, int device, bool required = true);
+    DevTensor concat_rows(const DevTensor& a, const DevTensor& b);
     ExpertTensor expert(const strata::GgufModel& g, const std::string& name);
     std::unique_ptr<strata::GgufModel> gguf_, mtp_gguf_;
     HParams hp_;
@@ -159,7 +161,8 @@ public:
     /// logits() and h_win() are the last window's.  Falls back to serial windows when the pipeline cannot run.
     void prompt_windows(int slot, const int32_t* tokens, int n, int wsize, const std::function<void(int, int, bool)>& on_window);
     bool pipeline_ready() const;
-    void drop_loans();   ///< before a prompt window: the decode loans in the prompt ring are dropped (the devices synced first)
+    void drop_loans();
+    void release_waits();   ///< after a doorbell failure: the parked device waits opened so the host can throw   ///< before a prompt window: the decode loans in the prompt ring are dropped (the devices synced first)
     int solo_slot() const { return n_slots_; }
     ~Engine();
     Engine(const Engine&) = delete;
@@ -349,6 +352,9 @@ public:
         int *row_k_d = nullptr, *grp_slot_d = nullptr, *grp_start_d = nullptr, *grp_len_d = nullptr;   ///< the slot runs (device)
         int *row_k_h = nullptr, *grp_slot_h = nullptr, *grp_start_h = nullptr, *grp_len_h = nullptr;
         // pinned host
+        int* pair_rank = nullptr;        ///< [pairs_alloc]: the grouping kernel's token-order ranks for wide deterministic windows
+        int32_t* cpu_skip_h = nullptr;   ///< mapped [n_layer][n_expert]: per non-resident rank, 1 = the CPU computes this expert's rows (mid-size windows)
+        int32_t* cpu_skip_d = nullptr;
         int32_t* ids_host = nullptr;
         int* sel_params_host = nullptr;
         float* bounce = nullptr;
@@ -410,6 +416,7 @@ private:
     int jT(const Dev& d) const { return d.job ? d.job->T : win_T_; }
     size_t stj(const Dev& d, int il) const { return st(il >= hp_.n_layer ? mtp_slot_ : jslot(d), il); }
     // the pipeline
+    bool mid_split_ = false;   ///< this mid-size window's misses split between PCIe and the CPU (serve_mid)
     bool pipe_on_ = false;
     std::vector<std::thread> stage_th_;
     std::vector<std::deque<Job*>> stage_q_;

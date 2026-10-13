@@ -989,3 +989,38 @@ in eight), which matched the best fixed count on both answers (34.2 / 34.1) at `
 run-to-run noise of 400-token runs (~3%) and on the server's first request the policy settled at 2 drafts; it was
 reverted to keep the decode loop simple. The configs stay at `--spec 2`. The acceptance data of the server's traffic
 (188 requests): median 72%, a third of the requests below 65% (Japanese and code answers), 2.57 tokens per round.
+
+## Small gains, pass 1 (2026-10-13)
+
+The phase profile of this build (40-token prompt 1.81 s; decode round 73-74 ms of GPU phases; 4K window 5.22 s) and
+what each item did:
+
+| item | finding | result |
+|---|---|---|
+| per-row weight re-reads | the F32 GEMV (router, indexer q_b), the mHC mixes and the DSA absorb/expand kernels read their matrix once per window row (grid y/z = t): 3x the bytes in a decode window | read-once forms for T <= 8 (bit-identical): decode 27.0 -> 28.4 tok/s; for wide windows the per-row grid stays (the 8-row form has too few blocks: mhc 374 -> 680 ms at 4K) |
+| mid-size windows (9 <= T < 256) | the misses all went over PCIe (serve_ring): a 40-token prompt waited 1.27 s of its 1.81 s | `serve_mid`: the decode path's CPU/PCIe split (the CPU takes the few-pair experts, at most 256 rows), the CPU's rows written into the MMQ layout (the grouping kernel keeps token order up to 2048 pairs: `det_n`), the device products skip them (a mask in the Q2_K WMMA kernel). Only Q2_K layers split: the first MoE layers of this model are Q4_K / Q3_K and take the generic MMQ, which has no mask (the first attempt computed stale ring data for them and corrupted the activations). 40 tokens 1.81 -> 1.16 s, 147 tokens 3.02 -> 2.03 s. `STRATA_GLM5_MID_CPU=0` disables |
+| prompt WMMA kernel | the activation sums re-packed per lane and super-block (16 loads + 32 ops per tile) | pre-packed per (column, super-block) as the decode kernel: 4K window 5.42 -> 5.36 s |
+| shared experts | gate and up as two products | concatenated at load (`concat_rows`), one product, `swiglu_clamp_gu_t` (one launch fewer per layer, twice the rows per launch) |
+| mHC mixes for wide windows | a GEMM-style kernel (the fn slice in LDS, the residual rows read once) | correct (max diff 1e-4 on values ~200) but no faster than the per-row grid (371 vs 374 ms at 4K) and it moves the greedy tokens: off by default (`STRATA_GLM5_MHC_WIDE=1`) |
+| small BF16 matrices in mid windows | 195 ms of "kda_gates" at T = 40 looked like slow BLAS calls | a one-time BLAS warm-up (~170 ms) that lands on whichever phase makes the process's first GEMM call; routing those matrices elsewhere just moved it. No change; a warm-up at start would take it off the first request |
+| doorbell failures | a failure in the doorbell thread left the device parked in `moe_wait` forever (two hangs today) | `release_waits()`: every layer's flags set to the window's token; the host thread throws at its next sync |
+| a routing id out of range | a segfault before | reported with the layer and window |
+
+Not measurable here: the HIP runtime's launch log (`AMD_LOG_LEVEL`) prints nothing with this ROCm; the per-round launch
+count (estimated ~1,200) remains a guess. The 430-token prompt-mode window shows the floor for prompts of 256+ tokens:
+every non-resident expert is prefetched (2.3 s of PCIe) whatever the routing; extending the split to those windows is
+the next lever for 256-2048-token prompts.
+
+## Small gains, pass 2 (2026-10-13)
+
+- **BLAS warm-up at start**: one tiny bf16 and f16 GEMM per device when the GEMM object is made; the process's first
+  prompt window no longer pays the ~170 ms (1064 tokens 3.42 -> 3.27 s, 430 tokens 3.35 -> 3.21 s in prompt mode).
+- **The split for single-window prompts past 256 tokens**: such windows prefetched every non-resident expert (2.3 s of
+  PCIe at 430 tokens). The mid-size path now takes windows up to `STRATA_GLM5_MID_MAX_T` (640) tokens: the misses
+  served by routing per layer, the CPU taking the few-pair experts (its cap 1024 rows per layer, the pinned result
+  block and the published MoE inputs double-buffered by layer parity), the grouping kernel ranking a window's pairs in
+  token order with a per-expert scan (`rank_scratch`). The crossover: 430 tokens 3.21 -> 2.58 s, 646 tokens 3.23 ->
+  3.04 s, 802 tokens 3.23 vs 3.30 s, 1064 tokens 3.27 vs 3.76 s (past ~700 tokens nearly every expert is routed with
+  many pairs: the CPU's share shrinks while the prefetch-ahead overlap is lost). Outputs differ from the prefetch-all
+  path only by the CPU's rounding (the 1064 + 24 test with the split: 24/24 the original reference). 40-token prompt
+  0.97 s (1.81 at the start of these passes), slots-test 0 mismatches.

@@ -47,11 +47,12 @@ __global__ void k_quant_act(const float* __restrict__ x, const int32_t* __restri
 template <int NT>
 __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict__ w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K,
                                                         const int32_t* __restrict__ bounds, const int8_t* __restrict__ codes, const float* __restrict__ scales,
-                                                        const int32_t* __restrict__ sums, float* __restrict__ dst, int ld_dst) {
+                                                        const int32_t* __restrict__ packed, float* __restrict__ dst, int ld_dst, const int32_t* __restrict__ skip) {
 #if STRATA_Q2K_WMMA
     const int e = blockIdx.z, c_first = bounds[e], n_cols = bounds[e + 1] - c_first;
     const int col0 = blockIdx.y * (16 * NT);
     if (col0 >= n_cols) return;
+    if (skip && skip[e]) return;   // its rows come from the CPU
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5, r = lane & 15, half = lane >> 4;
     const int row = blockIdx.x * kRowTile + wave * kRowsPerWave + r;
     if (row >= n_rows) return;   // n_rows % 16 == 0 keeps whole waves
@@ -59,12 +60,11 @@ __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict_
     const uint8_t* wrow = w + (uint64_t) e * expert_bytes + mat_off + (uint64_t) row * rowbytes;
     // the B rows this lane reads: column col0 + 16 n + r of the expert (clamped to the last one)
     const int8_t* brow[NT];
-    const int32_t* srow[NT];
-    const float* xrow[NT];
+    const int32_t* prow[NT];   // the packed sums of column c: [nsb][8] (lo bytes x4, hi bytes x4)
 #pragma unroll
     for (int n = 0; n < NT; ++n) {
         const int c = min(col0 + 16 * n + r, n_cols - 1) + c_first;
-        brow[n] = codes + (size_t) c * K; srow[n] = sums + (size_t) c * (K / 16); xrow[n] = scales + (size_t) c * nsb;
+        brow[n] = codes + (size_t) c * K; prow[n] = packed + (size_t) c * nsb * 8;
     }
     float accf[NT][8];
 #pragma unroll
@@ -106,15 +106,7 @@ __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict_
         for (int i = 0; i < 4; ++i) am[i] = (int) ((scw[i] >> 4) & 0x0f0f0f0fu);
 #pragma unroll
         for (int n = 0; n < NT; ++n) {
-            const int32_t* sp = srow[n] + sb * 16;
-            i32x4 blo, bhi;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                uint32_t lo = 0, hi = 0;
-#pragma unroll
-                for (int t = 0; t < 4; ++t) { const int v = sp[4 * i + t]; lo |= (uint32_t) (v & 0xff) << (8 * t); hi |= (uint32_t) ((v >> 8) & 0xff) << (8 * t); }
-                blo[i] = (int) lo; bhi[i] = (int) hi;
-            }
+            const i32x4 blo = *reinterpret_cast<const i32x4*>(prow[n] + sb * 8), bhi = *reinterpret_cast<const i32x4*>(prow[n] + sb * 8 + 4);
             i32x8 mlo = i32x8{0, 0, 0, 0, 0, 0, 0, 0}, mhi = i32x8{0, 0, 0, 0, 0, 0, 0, 0};
             mlo = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, blo, false, am, mlo, false);
             mhi = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, bhi, false, am, mhi, false);
@@ -135,7 +127,7 @@ __global__ void __launch_bounds__(kThreads) k_experts(const uint8_t* __restrict_
             if (c < n_cols) dst[(size_t) (c_first + c) * ld_dst + row] = accf[n][q];
         }
 #else
-    (void) w; (void) expert_bytes; (void) mat_off; (void) n_rows; (void) K; (void) bounds; (void) codes; (void) scales; (void) sums; (void) dst; (void) ld_dst;
+    (void) w; (void) expert_bytes; (void) mat_off; (void) n_rows; (void) K; (void) bounds; (void) codes; (void) scales; (void) packed; (void) dst; (void) ld_dst; (void) skip;
 #endif
 }
 
@@ -365,11 +357,11 @@ void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* c
 }
 
 void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K, const int32_t* bounds, int n, int max_cols,
-             const int8_t* codes, const float* scales, const int32_t* sums, float* dst, int ld_dst, void* s) {
+             const int8_t* codes, const float* scales, const int32_t* packed, float* dst, int ld_dst, void* s, const int32_t* skip) {
     if (n <= 0 || max_cols <= 0) return;
     if (n_rows % kRowTile) throw std::runtime_error("q2k: n_rows must be a multiple of " + std::to_string(kRowTile));
     const dim3 grid((unsigned) (n_rows / kRowTile), (unsigned) ((max_cols + 31) / 32), (unsigned) n);
-    k_experts<2><<<grid, kThreads, 0, S(s)>>>(w, expert_bytes, mat_off, n_rows, K, bounds, codes, scales, sums, dst, ld_dst);
+    k_experts<2><<<grid, kThreads, 0, S(s)>>>(w, expert_bytes, mat_off, n_rows, K, bounds, codes, scales, packed, dst, ld_dst, skip);
 }
 
 void dec_prepare(const void* x_q8_1, int K, int n_cols, int8_t* codes, float* d8, int32_t* usum, void* s) {
