@@ -1123,3 +1123,21 @@ projections ~1.0 s at ~27 TMAC/s, the LoD indexer's 1,700 small products 0.35 s)
 TMAC/s), the KDA scan 0.46 s, the mHC mixes 0.2 s, the BF16 GEMMs (f_b / g_b / fab / kv_a) 0.28 s. The Q2_K kernel with
 two accumulator sets per column tile (even / odd sub-blocks, int32: the same bits): 5.15 -> 5.12 s - its limit is not the
 accumulator chain.
+
+## Small gains, pass 6: the host side measured (2026-10-14)
+
+Where the host could be the round's limit, measured rather than assumed:
+
+- **The enqueue thread.** `STRATA_GLM5_HOSTTRACE=1` prints a window's host enqueue time and its three largest pauses:
+  2.3 ms for a 3-row window, no pause above 0.15 ms. The 10 ms "both cards idle" gaps a profiler trace showed at window
+  starts are the profiler's own per-launch cost (the same run is 30% slower under rocprofv3), not the engine's.
+- **The CPU service's pool.** Workers that spin on the batch counter before sleeping, and the calling thread taking jobs
+  too (`STRATA_GLM5_POOL_SPIN_US`): 66.5 against 67.0 ms per round - the two wake-ups per layer are not a cost against
+  batches of a millisecond. The default stays a plain wake-up. The phase counters (`cpu phases` on the CLI's last line)
+  put the service's own overheads - the split, the quantizations, the enqueue - at 5% of its time; the rest is the
+  products at ~30 GB/s of pinned reads with the PCIe DMA sharing the bus: the memory bus, as before. (A multi-token
+  Q2_K dot, unpacking a row once for its ~1.4 tokens, was not written: the Q4_K one in the same place measured no gain
+  for the same reason - the rows stay in L1 across the per-token calls.)
+- **The server.** A streaming client sees the engine's own rate (36.4 and 41.8 tok/s against the engine's 36.4 and
+  41.8) and the first chunk 25 ms after the engine's prompt time: the Python layer adds nothing measurable. Tokens
+  arrive in bursts of a speculative round (median gap 0, p90 ~70 ms).

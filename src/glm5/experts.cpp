@@ -119,35 +119,68 @@ void ExpertStore::read_blob(const LayerExperts& E, int e, uint8_t* dst) const {
 }
 
 void ExpertStore::Pool::start(int n) {
+    if (const char* ev = std::getenv("STRATA_GLM5_POOL_SPIN_US")) spin_us = std::max(0, std::atoi(ev));
     for (int t = 0; t < n; ++t)
         threads.emplace_back([this]() {
+            uint32_t seen = 0;
             for (;;) {
-                std::function<void()> job;
-                {
-                    std::unique_lock<std::mutex> lk(m);
-                    cv.wait(lk, [&] { return stop || next < jobs.size(); });
-                    if (stop) return;
-                    job = jobs[next++];
+                // the next batch: spin first, then sleep on the condition variable
+                uint32_t g = gen.load(std::memory_order_acquire);
+                if (g == seen && !stop.load(std::memory_order_acquire)) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while ((g = gen.load(std::memory_order_acquire)) == seen && !stop.load(std::memory_order_acquire)) {
+                        if (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() > spin_us) {
+                            std::unique_lock<std::mutex> lk(m);
+                            cv.wait(lk, [&] { return stop.load() || gen.load(std::memory_order_acquire) != seen; });
+                            g = gen.load(std::memory_order_acquire);
+                            break;
+                        }
+                        std::this_thread::yield();
+                    }
                 }
-                job();
-                std::lock_guard<std::mutex> lk(m);
-                if (++finished == total) done.notify_all();
+                if (stop.load(std::memory_order_acquire)) return;
+                seen = g;
+                for (;;) {
+                    const size_t i = next.fetch_add(1, std::memory_order_acq_rel);
+                    if (i >= total) break;
+                    jobs[i]();
+                    if (finished.fetch_add(1, std::memory_order_acq_rel) + 1 == total) { std::lock_guard<std::mutex> lk(m); done.notify_all(); }
+                }
             }
         });
 }
 void ExpertStore::Pool::run(std::vector<std::function<void()>>&& js) {
     if (js.empty()) return;
     std::lock_guard<std::mutex> outer(run_m);   // one batch at a time (the stage threads of two devices may both miss pins)
-    std::unique_lock<std::mutex> lk(m);
     jobs = std::move(js);
-    next = finished = 0;
     total = jobs.size();
+    next.store(0, std::memory_order_relaxed);
+    finished.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(m);   // (the sleepers' predicate reads gen under the lock: no lost wake-up)
+        gen.fetch_add(1, std::memory_order_acq_rel);
+    }
     cv.notify_all();
-    done.wait(lk, [&] { return finished == total; });
+    // the caller takes jobs too, then spins for the rest (the batch is a layer's share: a millisecond or two)
+    for (;;) {
+        const size_t i = next.fetch_add(1, std::memory_order_acq_rel);
+        if (i >= total) break;
+        jobs[i]();
+        finished.fetch_add(1, std::memory_order_acq_rel);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (finished.load(std::memory_order_acquire) < total) {
+        if (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() > spin_us) {
+            std::unique_lock<std::mutex> lk(m);
+            done.wait(lk, [&] { return finished.load(std::memory_order_acquire) >= total; });
+            break;
+        }
+        std::this_thread::yield();
+    }
     jobs.clear();
 }
 ExpertStore::Pool::~Pool() {
-    { std::lock_guard<std::mutex> lk(m); stop = true; }
+    { std::lock_guard<std::mutex> lk(m); stop.store(true); gen.fetch_add(1); }
     cv.notify_all();
     for (auto& t : threads) t.join();
 }

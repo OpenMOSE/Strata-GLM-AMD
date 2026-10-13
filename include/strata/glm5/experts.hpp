@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <atomic>
 #include <deque>
 #include <cstdint>
 #include <cstdio>
@@ -193,12 +194,17 @@ private:
     // a small pool that memcpy's missed blobs from the mapped file into the pinned staging (a pageable
     // hipMemcpyAsync from the mapping took 1-2 ms per blob; memcpy on several threads plus one DMA takes ~0.3 ms)
     struct Pool {
+        // a batch of jobs on n threads: the workers spin on the batch counter for spin_us (a decode window issues a batch
+        // every ~1 ms: a condition-variable wake-up each time cost 50-100 us), then block; the caller spins the same way
         std::vector<std::thread> threads;
         std::mutex m, run_m;
         std::condition_variable cv, done;
         std::vector<std::function<void()>> jobs;
-        size_t next = 0, finished = 0, total = 0;
-        bool stop = false;
+        std::atomic<uint32_t> gen{0};              ///< the batch counter (a worker runs the jobs of each generation it sees)
+        std::atomic<size_t> next{0}, finished{0};
+        size_t total = 0;
+        std::atomic<bool> stop{false};
+        int spin_us = 0;   // (STRATA_GLM5_POOL_SPIN_US; a spin of 1.5 ms measured the same round time as the plain wake-up: the batches are long against it)
         void start(int n);
         void run(std::vector<std::function<void()>>&& js);
         ~Pool();

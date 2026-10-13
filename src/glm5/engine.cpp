@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <tuple>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -64,6 +65,14 @@ static const bool kSwigluFuse = !std::getenv("STRATA_GLM5_SWIGLU_FUSE") || std::
 static const bool kPackFuse = !std::getenv("STRATA_GLM5_PACK_FUSE") || std::atoi(std::getenv("STRATA_GLM5_PACK_FUSE")) != 0;   // 0: the sums packed by a separate launch
 static const bool kRollbackTable = !std::getenv("STRATA_GLM5_ROLLBACK_TABLE") || std::atoi(std::getenv("STRATA_GLM5_ROLLBACK_TABLE")) != 0;   // 0: the rollback as memcpys
 static const bool kNarrowBf16 = !std::getenv("STRATA_GLM5_NARROW_BF16") || std::atoi(std::getenv("STRATA_GLM5_NARROW_BF16")) != 0;   // 0: the generic BF16 kernel for narrow weights
+static const bool kHostTrace = std::getenv("STRATA_GLM5_HOSTTRACE") && std::atoi(std::getenv("STRATA_GLM5_HOSTTRACE")) != 0;   // the enqueue thread's largest pauses per window
+static std::vector<std::pair<double, std::string>> g_host_marks;   // (ms since the window start, label); the engine thread only
+static std::chrono::steady_clock::time_point g_host_t0;
+static void host_mark(const char* what, int il = -1) {
+    if (!kHostTrace) return;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_host_t0).count();
+    g_host_marks.emplace_back(ms, il >= 0 ? std::string(what) + " L" + std::to_string(il) : std::string(what));
+}
 static const bool kMoeEarly = !std::getenv("STRATA_GLM5_MOE_EARLY") || std::atoi(std::getenv("STRATA_GLM5_MOE_EARLY")) != 0;   // 0: the resident down products and shared experts after the wait
 static const bool kMhcDec = !std::getenv("STRATA_GLM5_MHC_DEC") || std::atoi(std::getenv("STRATA_GLM5_MHC_DEC")) != 0;   // 0: the separate mHC kernels for small windows        // ... and the f_a | g_a | beta ones (the verify windows; the scratch is this many rows)
 constexpr int kPrefetchAllMinT = 256;   // prompt windows at least this wide prefetch every non-resident expert (42 GB per window here)
@@ -1877,6 +1886,7 @@ void Engine::forward_window_impl(const int32_t* tokens, int T, const DumpFn& dum
         }
     }
     j.tok = tok_;
+    if (kHostTrace) { g_host_marks.clear(); g_host_t0 = std::chrono::steady_clock::now(); host_mark("window start"); }
     for (auto& dd : devs_) dd.job = &j;
     if (doorbell_ && prompt_mode_ && !mid_mode_) for (auto& dd : devs_) prefetch_up_to(dd, j, experts_->win_bufs());   // every device fills its ring at once
     // the layer stages, device by device (the layers of a device are contiguous)
@@ -1890,6 +1900,16 @@ void Engine::forward_window_impl(const int32_t* tokens, int T, const DumpFn& dum
     }
     for (auto& dd : devs_) dd.job = nullptr;
     const auto tw1 = std::chrono::steady_clock::now();
+    host_mark("enqueued");
+    if (kHostTrace) {
+        // the three largest pauses of the enqueue thread inside this window (the host latency the devices wait on)
+        std::vector<std::tuple<double, std::string, std::string>> gaps;
+        for (size_t i = 1; i < g_host_marks.size(); ++i) gaps.emplace_back(g_host_marks[i].first - g_host_marks[i - 1].first, g_host_marks[i - 1].second, g_host_marks[i].second);
+        std::sort(gaps.begin(), gaps.end(), [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+        std::fprintf(stderr, "glm5 host: tok %u T %d enqueue %.2f ms;", tok_, T, g_host_marks.back().first);
+        for (size_t i = 0; i < gaps.size() && i < 3; ++i) std::fprintf(stderr, " %.2f ms (%s -> %s)", std::get<0>(gaps[i]), std::get<1>(gaps[i]).c_str(), std::get<2>(gaps[i]).c_str());
+        std::fprintf(stderr, "\n");
+    }
     if (kTrace) std::fprintf(stderr, "glm5: tok %u all layers enqueued (pending %d), waiting\n", tok_, pending_.load());
     if (doorbell_ && (!prompt_mode_ || mid_mode_)) { wait_served(hp_.n_layer); db_active_.store(false, std::memory_order_release); }
     if (kTrace) std::fprintf(stderr, "glm5: tok %u served all\n", tok_);
@@ -1913,6 +1933,7 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
     const int p = j.parity;
     check(cudaSetDevice(d.ordinal), "cudaSetDevice");
     d.job = &j;
+    host_mark("stage start", il0);
     if (doorbell_) u32_inc(d.tok_dev, d.stream);
     if (doorbell_ && prompt_mode_ && !mid_mode_) prefetch_up_to(d, j, experts_->win_bufs());   // (a no-op when the previous window's stage ran ahead)
     if (il0 == 0) {
@@ -1939,6 +1960,7 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         const int dv = d.ordinal;
         DumpFn dl = dump ? [&](const std::string& n, const void* ptr, const std::vector<int64_t>& sh, bool i, int) { dump(n + "-" + std::to_string(il), ptr, sh, i, dv); } : DumpFn();
         prof_mark(d, "embed/mhc_post");
+        host_mark("layer", il);
         // the layer over the window in chunks of at most t_chunk_ tokens (the scratch is chunk-sized; R spans the window)
         const int TC = std::min(T, t_chunk_), n_chunks = (T + TC - 1) / TC;
         for (int c = 0; c < n_chunks; ++c) {
@@ -1951,8 +1973,10 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         if (dl) dl("attn_norm", d.xn, {E}, false, dv);
         prof_mark(d, "mhc");
         if (kDebugSync) { debug_sync(d.stream, il, "pre-attention"); debug_nan(d.xn, Tc, E, il, "attn_norm"); }
+        host_mark("attn", il);
         if (hp_.is_recr[(size_t) il]) kda_layer(d, il, Tc, d.xn, d.y, dl);
         else dsa_layer(d, il, Tc, j.pos0 + c0, d.xn, d.y, dl);
+        host_mark("ffn", il);
         if (kDebugSync) { debug_sync(d.stream, il, hp_.is_recr[(size_t) il] ? "kda" : "dsa"); debug_nan(d.y, Tc, E, il, hp_.is_recr[(size_t) il] ? "kda out" : "dsa out"); }
         prof_mark(d, hp_.is_recr[(size_t) il] ? "kda" : "dsa");
         mhc_post_t(d.y, Rc, d.post, d.comb, Rc, Tc, E, hp_.hc, d.stream);
@@ -1987,6 +2011,7 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         return;
     }
     prof_mark(d, "embed/mhc_post");
+    host_mark("head");
     mean_streams(d.R, d.x, T, E, hp_.hc, d.stream);
     if (dump) dump("hc_head", d.x, {E}, false, d.ordinal);
     rms_norm(d.x, m_.output_norm().f32(), d.h_win, T, E, hp_.rms_eps, d.stream);
