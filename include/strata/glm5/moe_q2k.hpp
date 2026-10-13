@@ -12,7 +12,10 @@
 namespace strata::glm5::q2k {
 bool available();   ///< the device code is built (gfx11 WMMA)
 /// int8 rows [rows][K] (row = ids ? x row ids[row] : row), scales [rows][K/256] f32, sums [rows][K/16] int32.  K % 256 == 0.
-void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* stream);
+/// row_lo / row_hi (nullable, device): only the rows in [*row_lo, *row_hi) are written
+/// packed (nullable): the sums packed per (row, super-block) as pack_sums does, written here instead of `sums`
+void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* stream,
+                  const int* row_lo = nullptr, const int* row_hi = nullptr, int32_t* packed = nullptr);
 /// dst[(bounds[e] + c) * ld_dst + r] = w_e[r] . act[bounds[e] + c] for expert e in [0, n), its columns [bounds[e], bounds[e+1]),
 /// its matrix at w + e * expert_bytes + mat_off ([n_rows][K] Q2_K, row pitch K/256*84 bytes).  max_cols bounds the grid.
 void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K, const int32_t* bounds, int n, int max_cols,
@@ -30,7 +33,7 @@ void dec_grouped(const void* const* wp, const int* col0, const int* ncols, const
 /// The decode products on WMMA (gfx11): the window's activations quantized by quantize_act (codes [cols][K], scales
 /// [cols][K/256], sums [cols][K/16]) with the sums packed once per (column, super-block) by pack_sums (packed [cols][K/256][8]);
 /// then y[(orow[g] + c) * n_out + r] = w_g[r] . act[col0[g] + c] for the groups [*g_begin, *g_end), c < ncols[g] <= 16.
-void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* stream);
+void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* stream, const int* row_lo = nullptr, const int* row_hi = nullptr);
 void dec_wmma(const void* const* wp, const int* col0, const int* ncols, const int* orow, const int* g_begin, const int* g_end,
               const int8_t* codes, const float* scales, const int32_t* packed, float* y, int K, int n_out, void* stream);
 }  // namespace strata::glm5::q2k

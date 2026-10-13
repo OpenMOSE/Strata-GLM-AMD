@@ -23,9 +23,12 @@ constexpr int kRowsPerWave = 16, kWaves = 8, kThreads = 32 * kWaves, kRowTile = 
 
 // ---- the activation quantizer: block per (row, 256-block), thread per value
 __global__ void k_quant_act(const float* __restrict__ x, const int32_t* __restrict__ ids, int K, int8_t* __restrict__ codes,
-                            float* __restrict__ scales, int32_t* __restrict__ sums) {
+                            float* __restrict__ scales, int32_t* __restrict__ sums, const int* __restrict__ row_lo, const int* __restrict__ row_hi,
+                            int32_t* __restrict__ packed) {
     __shared__ float red[8];
+    __shared__ int s16[16];
     const int row = blockIdx.y, blk = blockIdx.x, k = blk * 256 + threadIdx.x;
+    if ((row_lo && row < *row_lo) || (row_hi && row >= *row_hi)) return;
     const int src = ids ? ids[row] : row;
     const float v = x[(size_t) src * K + k];
     float am = fabsf(v);
@@ -39,8 +42,21 @@ __global__ void k_quant_act(const float* __restrict__ x, const int32_t* __restri
     codes[(size_t) row * K + k] = (int8_t) q;
     int s = q;
     for (int o = 8; o > 0; o >>= 1) s += __shfl_xor(s, o, 32);   // the 16-lane sums (lanes 0..15 and 16..31 of a wave)
-    if ((threadIdx.x & 15) == 0) sums[(size_t) row * (K / 16) + k / 16] = s;
     if (threadIdx.x == 0) scales[(size_t) row * (K / 256) + blk] = d;
+    if (!packed) {
+        if ((threadIdx.x & 15) == 0) sums[(size_t) row * (K / 16) + k / 16] = s;
+        return;
+    }
+    // this super-block's 16 sums packed here (k_pack_sums' layout): thread i < 4 the low bytes of sums 4 i .. 4 i + 3, i >= 4 the high bytes
+    if ((threadIdx.x & 15) == 0) s16[threadIdx.x >> 4] = s;
+    __syncthreads();
+    if (threadIdx.x < 8) {
+        const int i = threadIdx.x;
+        uint32_t v = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) { const int xq = s16[4 * (i & 3) + t]; v |= (uint32_t) ((i < 4 ? xq : (xq >> 8)) & 0xff) << (8 * t); }
+        packed[((size_t) row * (K / 256) + blk) * 8 + i] = (int32_t) v;
+    }
 }
 
 // ---- the expert products: block = 8 waves x 16 weight rows (128 rows), NT column tiles of 16; grid (row tiles, col tiles, experts)
@@ -267,9 +283,10 @@ __global__ void __launch_bounds__(kDecThreads) k_dec(const void* const* __restri
 
 // ---- the decode WMMA kernel: one 16-column tile per group (a decode window has at most 8 pairs on one expert), the
 // activation sums pre-packed per (column, super-block) as the min term's B operands; block = 8 waves x 16 rows of one group.
-__global__ void k_pack_sums(const int32_t* __restrict__ sums, int nsb, int32_t* __restrict__ packed) {
+__global__ void k_pack_sums(const int32_t* __restrict__ sums, int nsb, int32_t* __restrict__ packed, const int* __restrict__ row_lo, const int* __restrict__ row_hi) {
     // grid (nsb, cols), 8 threads: thread i < 4 packs the low bytes of sums[16 sb + 4 i .. + 3], i >= 4 the high bytes
     const int sb = blockIdx.x, c = blockIdx.y, i = threadIdx.x;
+    if ((row_lo && c < *row_lo) || (row_hi && c >= *row_hi)) return;
     const int32_t* sp = sums + ((size_t) c * nsb + sb) * 16 + 4 * (i & 3);
     uint32_t v = 0;
 #pragma unroll
@@ -350,10 +367,11 @@ __global__ void __launch_bounds__(kThreads) k_dec_wmma(const void* const* __rest
 
 bool available() { return STRATA_Q2K_WMMA != 0 || true; }
 
-void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* s) {
+void quantize_act(const float* x, const int32_t* ids, int rows, int K, int8_t* codes, float* scales, int32_t* sums, void* s, const int* row_lo,
+                  const int* row_hi, int32_t* packed) {
     if (K % 256) throw std::runtime_error("q2k: K must be a multiple of 256");
     if (rows <= 0) return;
-    k_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows), 256, 0, S(s)>>>(x, ids, K, codes, scales, sums);
+    k_quant_act<<<dim3((unsigned) (K / 256), (unsigned) rows), 256, 0, S(s)>>>(x, ids, K, codes, scales, sums, row_lo, row_hi, packed);
 }
 
 void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_rows, int K, const int32_t* bounds, int n, int max_cols,
@@ -393,9 +411,9 @@ void dec_grouped(const void* const* wp, const int* col0, const int* ncols, const
     }
 }
 
-void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* s) {
+void pack_sums(const int32_t* sums, int cols, int K, int32_t* packed, void* s, const int* row_lo, const int* row_hi) {
     if (cols <= 0) return;
-    k_pack_sums<<<dim3((unsigned) (K / 256), (unsigned) cols), 8, 0, S(s)>>>(sums, K / 256, packed);
+    k_pack_sums<<<dim3((unsigned) (K / 256), (unsigned) cols), 8, 0, S(s)>>>(sums, K / 256, packed, row_lo, row_hi);
 }
 
 void dec_wmma(const void* const* wp, const int* col0, const int* ncols, const int* orow, const int* g_begin, const int* g_end,

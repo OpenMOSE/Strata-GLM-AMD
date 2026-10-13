@@ -209,18 +209,17 @@ void Model::init(const std::string&, bool verbose) {
         L.hc_ffn_scale = up("hc_ffn_scale.weight");
         L.hc_ffn_base = up("hc_ffn_base.weight");
         if (hp_.is_recr[(size_t) il]) {
-            L.wq = up("attn_q.weight");
-            L.wk = up("attn_k.weight");
-            L.wv = up("attn_v.weight");
+            {   // q | k | v as one product; their conv taps stacked the same way; f_a | g_a | beta as one (all from the normed input)
+                DevTensor wq = up("attn_q.weight"), wk = up("attn_k.weight"), wv = up("attn_v.weight");
+                L.wqkv = stack_rows({&wq, &wk, &wv});
+                DevTensor cq = up("ssm_conv1d_q.weight"), ck = up("ssm_conv1d_k.weight"), cv = up("ssm_conv1d_v.weight");
+                L.conv_qkv = stack_rows({&cq, &ck, &cv});
+                DevTensor fa = up("ssm_f_a.weight"), ga = up("ssm_g_a.weight"), be = up("ssm_beta.weight");
+                L.fab = stack_rows({&fa, &ga, &be});
+            }
             L.wo = up("attn_output.weight");
-            L.conv_q = up("ssm_conv1d_q.weight");
-            L.conv_k = up("ssm_conv1d_k.weight");
-            L.conv_v = up("ssm_conv1d_v.weight");
-            L.f_a = up("ssm_f_a.weight");
             L.f_b = up("ssm_f_b.weight");
-            L.g_a = up("ssm_g_a.weight");
             L.g_b = up("ssm_g_b.weight");
-            L.beta = up("ssm_beta.weight");
             L.ssm_a = up("ssm_a");
             L.dt_b = up("ssm_dt.bias");
             L.ssm_norm = up("ssm_norm.weight");
@@ -244,16 +243,19 @@ void Model::init(const std::string&, bool verbose) {
             L.idx_ape = up("indexer_compressor_ape.weight");
         }
         if (il < hp_.n_dense_lead) {
-            L.ffn_gate = up("ffn_gate.weight");
-            L.ffn_up = up("ffn_up.weight");
+            {
+                DevTensor fg = up("ffn_gate.weight"), fu = up("ffn_up.weight");
+                L.ffn_gu = stack_rows({&fg, &fu});
+            }
             L.ffn_down = up("ffn_down.weight");
         } else {
             L.gate_inp = up("ffn_gate_inp.weight");
             L.exp_probs_b = up("exp_probs_b.bias", false);
-            L.sh_gate = up("ffn_gate_shexp.weight");
-            L.sh_up = up("ffn_up_shexp.weight");
+            {
+                DevTensor sg = up("ffn_gate_shexp.weight"), su = up("ffn_up_shexp.weight");
+                L.sh_gu = stack_rows({&sg, &su});
+            }
             L.sh_down = up("ffn_down_shexp.weight");
-            L.sh_gu = concat_rows(L.sh_gate, L.sh_up);
             L.exp_gate = expert(*gguf_, b + "ffn_gate_exps.weight");
             L.exp_up = expert(*gguf_, b + "ffn_up_exps.weight");
             L.exp_down = expert(*gguf_, b + "ffn_down_exps.weight");
@@ -275,21 +277,51 @@ uint64_t Model::device_bytes(int ordinal) const {
     return ordinal >= 0 && (size_t) ordinal < bytes_per_device_.size() ? bytes_per_device_[(size_t) ordinal] : 0;
 }
 
-// a and b (same type, same row length) stacked as one matrix [a.ne1 + b.ne1][ne0] on a's device
-DevTensor Model::concat_rows(const DevTensor& a, const DevTensor& b) {
-    if (!a.present() || !b.present() || a.type != b.type || a.ne0 != b.ne0 || a.device != b.device) return {};
+// the parts (same type, same row length, same device) stacked as one matrix [sum ne1][ne0] (row-contiguous types:
+// the stacked bytes are the parts' bytes in order); the parts' own buffers are freed (the whole replaces them)
+DevTensor Model::stack_rows(std::initializer_list<DevTensor*> parts) {
+    const DevTensor& a = **parts.begin();
+    uint64_t bytes = 0;
+    int64_t ne1 = 0;
+    for (const DevTensor* t : parts) {
+        if (!t->present() || t->type != a.type || t->ne0 != a.ne0 || t->device != a.device)
+            throw std::runtime_error("stack_rows: the parts differ in type, row length or device");
+        bytes += t->bytes;
+        ne1 += t->ne1 * std::max<int64_t>(t->ne2, 1);
+    }
     check(cudaSetDevice(a.device), "cudaSetDevice");
     void* d = nullptr;
-    check(cudaMalloc(&d, a.bytes + b.bytes), "cudaMalloc concat");
+    check(cudaMalloc(&d, bytes), "cudaMalloc stack");
     allocations_.push_back(d);
     alloc_device_.push_back(a.device);
-    check(cudaMemcpy(d, a.data, a.bytes, cudaMemcpyDeviceToDevice), "concat a");
-    check(cudaMemcpy(static_cast<uint8_t*>(d) + a.bytes, b.data, b.bytes, cudaMemcpyDeviceToDevice), "concat b");
-    bytes_ += a.bytes + b.bytes;
-    bytes_per_device_[(size_t) a.device] += a.bytes + b.bytes;
+    uint64_t off = 0;
+    for (const DevTensor* t : parts) {
+        check(cudaMemcpy(static_cast<uint8_t*>(d) + off, t->data, t->bytes, cudaMemcpyDeviceToDevice), "stack part");
+        off += t->bytes;
+    }
+    bytes_ += bytes;
+    bytes_per_device_[(size_t) a.device] += bytes;
     DevTensor r = a;
-    r.data = d; r.bytes = a.bytes + b.bytes; r.ne1 = a.ne1 + b.ne1;
+    r.data = d; r.bytes = bytes; r.ne1 = ne1; r.ne2 = 1;
+    for (DevTensor* t : parts) release(*t);
     return r;
+}
+
+// frees one uploaded tensor's device buffer (an original that a stacked copy replaced)
+void Model::release(DevTensor& t) {
+    if (!t.present()) return;
+    for (size_t i = 0; i < allocations_.size(); ++i) {
+        if (allocations_[i] != t.data) continue;
+        check(cudaSetDevice(alloc_device_[i]), "cudaSetDevice");
+        check(cudaFree(allocations_[i]), "cudaFree release");
+        allocations_.erase(allocations_.begin() + (std::ptrdiff_t) i);
+        alloc_device_.erase(alloc_device_.begin() + (std::ptrdiff_t) i);
+        bytes_ -= t.bytes;
+        bytes_per_device_[(size_t) t.device] -= t.bytes;
+        t = DevTensor{};
+        return;
+    }
+    throw std::runtime_error("release: not an uploaded tensor");
 }
 
 DevTensor Model::upload(const strata::GgufModel& gg, const std::string& name, int device, bool required) {
@@ -367,10 +399,11 @@ void Model::attach_mtp(const std::string& path, bool verbose) {
     L.idx_ape = up("indexer_compressor_ape.weight");
     L.gate_inp = up("ffn_gate_inp.weight");
     L.exp_probs_b = up("exp_probs_b.bias", false);
-    L.sh_gate = up("ffn_gate_shexp.weight");
-    L.sh_up = up("ffn_up_shexp.weight");
+    {
+        DevTensor sg = up("ffn_gate_shexp.weight"), su = up("ffn_up_shexp.weight");
+        L.sh_gu = stack_rows({&sg, &su});
+    }
     L.sh_down = up("ffn_down_shexp.weight");
-    L.sh_gu = concat_rows(L.sh_gate, L.sh_up);
     L.exp_gate = expert(*mtp_gguf_, b + "ffn_gate_exps.weight");
     L.exp_up = expert(*mtp_gguf_, b + "ffn_up_exps.weight");
     L.exp_down = expert(*mtp_gguf_, b + "ffn_down_exps.weight");

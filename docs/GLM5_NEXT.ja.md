@@ -987,3 +987,42 @@ TypeScript 32.4) と、本数ごとの実測レート (トークン数と所要�
   3.27 vs 3.76 s (約 700 トークンを超えるとほぼ全 expert が多数の対で routing され、CPU の取り分が縮む一方で先読みの重なりを失う)。
   出力は prefetch-all 経路と CPU の丸めぶんだけ異なる (分担ありの 1064 + 24 テストは元の参照と 24/24 一致)。40 トークンのプロンプト
   0.97 s (この一連の作業の開始時 1.81 s)、slots-test 0 mismatches。
+
+## 小さな改善、第 3 回: decode ラウンド (2026-10-13)
+
+この回の前に decode ラウンド (3 行、spec 2) のカーネル調査 (rocprofv3) を取った: 2 枚のカードでラウンドあたり約 3,430 回の起動、
+カーネル約 46 ms、CPU 供給の expert を待つ doorbell の空転約 50 ms、カーネル間の隙間約 13 ms (1 回 3〜4 us: RDNA 3 の in-order
+キューが依存する起動の間に置く)。この回は起動数を減らし、待ちの下に仕事を移す。変更はすべて環境変数で戻せる (併記)。slots-test
+(solo と batch 行の比較、CPU 供給 off) は 0 mismatches のまま。
+
+- **KDA 層** (`STRATA_GLM5_KDA_FUSE=0` で元に): q | k | v を積んだ 1 つの Q8_0 積と 1 回の conv 起動 (`wqkv`、`conv_qkv`; prompt 窓は
+  3 つの行スライスを順に)、f_a | g_a | beta を 1 つの BF16 積 (`fab`、列はストライド読み)、scan と前後の処理を 1 カーネルに
+  (`k_kda_step_f`: L2 正規化、ゲート、beta の sigmoid、再帰、出力の RMS norm とゲート; ゲートの exp は状態行ごとでなく要素ごとに 1 回)。
+  置き換えた連鎖とビット一致。層あたり 26 起動 → 10。
+- **mHC の decode 末尾** (`STRATA_GLM5_MHC_DEC=0`): rs + 非線形 + pre-mix + 続く RMS norm をトークンごと 1 ブロック (`k_mhc_finish_t`、
+  1024 スレッド); mixes カーネルはスケールなしで走り、和にスケールを掛ける (この回で唯一の丸めの変更)。層の半分あたり 6 起動 → 2。
+- **MoE の順序** (`STRATA_GLM5_MOE_EARLY=0`): 常駐 expert の swiglu / down 積と共有 expert を、供給されるミスの待ちより前に (そこで
+  GPU は遊んでいた); combine が共有の行を足して層出力へ直接書く (`add_rows` + memcpy が消えた)。ビット一致。
+- **生成側で q8 行を作る** (`STRATA_GLM5_Q8_FUSE=0`): `xn`、KDA 出力 `y`、共有 expert の `h` を書くカーネルが q8_1 行も書く
+  (`native_quantize_q8_1` と同じビット、32 要素ブロックごとに 1 warp) ので、そこから始まる Q8_0 射影は別の quantize 起動を省く
+  (`gemv_q8`)。dense 層の gate | up も積んだ。
+- **細かいもの**: CPU 供給の行のコピーを層ごと 1 回の記述子駆動の起動に (expert ごとだった); Q2_K の活性量子化が自分で和を詰める
+  (decode 経路から `pack_sums` が消えた); routing カーネルの直列部は 288 全部でなく routed された expert (shared memory でソート) を
+  歩く (38 → 16 us); 残差ストリームの初期化と平均を窓ごと 1 起動に; draft 巻き戻しの 136 回の状態 memcpy をカードごと 1 回の
+  テーブル駆動起動に; f_b / g_b 向けの狭い K の BF16 GEMV (出力行ごと 1 スレッド、列は shared memory) (`STRATA_GLM5_NARROW_BF16=0`);
+  MoE の q8 入力は非 Q2_K 層でだけ作る。
+- **貸出プールを prompt スクラッチへ** (`STRATA_GLM5_LOAN_SCRATCH=0`): decode 窓が使わないバッファ (dense attention と MMQ / GEMM の
+  スクラッチは丸ごと、対・射影・attention のバッファは 16 行分より後ろ) も貸出スロットに刻む: リング 622 + スクラッチ 892 スロット
+  (7.4 GB 増)。prompt 窓 (T >= 9) はバッファに触る前に貸出を落とす仕組みがもともとある。
+
+decode ラウンドあたり (40 トークンのプロンプト後の 200 トークン; ラウンドあたりのトークン数は受理された draft で変わるので
+ラウンド時間で測る): この回の前 79.0 ms → 76.7 (KDA) → 74.7 (mHC、MoE 順序) → 73.6 (q8 行、routing、コピー) → 69.4 ms (スクラッチの
+貸出プール) → 67.3 ms (狭い BF16 GEMV、和を詰める量子化、巻き戻しテーブル、広い mHC 末尾); ラウンドあたりの起動 3,430 → 2,295
+(貸出変更の前)。試して戻したもの: llama.cpp の 2 行/ブロックの多列 MMVQ 配置 (`STRATA_GLM5_MMVQ_UPSTREAM=1`): 67.7 ms、利得なし。
+この回ではほかに: 貸出コピーをコピーエンジンでなくシェーダのカーネルで (`STRATA_GLM5_LOAN_MEMCPY=1` で元に)、doorbell の publish の
+ホスト書き込みを 16 バイト単位に。未解決: CPU 供給 off (`STRATA_GLM5_CPU=0`、slots-test のモード) では、この回の後の solo decode が
+全スイッチ off でも 75 → 83 ms/token と測れ、GPU の各フェーズは doorbell の待ち以外すべて同じ; 同じ routing でヒットが減る
+(VRAM から 82.5 → 79.8%、adaptive swap と thrash が増える) - 先読みの staging と swap の方針がタイミングの変化に反応している。
+サーバが走る CPU 供給モードは一貫して速い。slots-test の solo decode (CPU 供給 off): 84.0 → 74.7 ms/token。
+プロンプトは変わらず (40 トークン 0.97 s、430 トークン 2.59 s、1064 トークン 3.26 s、1064 トークンの出力は同一)。残るラウンド:
+CPU 供給 expert の待ち約 43 ms (メモリバス律速)、Q8_0 dense 積約 12 ms、Q2_K expert 積約 10 ms、起動の隙間約 11 ms。

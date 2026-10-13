@@ -236,6 +236,11 @@ checked against is llama.cpp's `glm5-next`; `tools/glm_oracle/` dumps its interm
 
 ## What changed
 
+- **2026-10-13 (later)** - Small gains, pass 3, the decode round: the KDA layer's projections stacked and its scan fused
+  with its gates and norms, the mHC tail in one launch, the resident experts' down product and the shared experts
+  computed while the GPU waits for the CPU-served experts, the producers writing their own q8 rows, the decode-time
+  expert cache extended into the prompt scratch (622 -> 1,514 slots). Launches per round 3,430 -> ~2,100; a decode
+  round 79 -> 67 ms (28.8 -> ~34 tok/s on the 40-token test); prompts unchanged ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md)).
 - **2026-10-13** - Small gains, passes 1 and 2: the single-token GEMV reads each weight row once for up to 8 columns, the
   mHC and DSA absorb/expand kernels sized to the window, a BLAS warm-up at start, the CPU/PCIe split of mid-size
   windows extended to single-window prompts up to 640 tokens. Decode 27.0 -> 28.8 tok/s; a 40-token prompt 1.81 ->

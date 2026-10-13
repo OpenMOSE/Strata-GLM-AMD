@@ -156,6 +156,10 @@ public:
     const uint8_t* const* loan_ptrs(int device_index) const { return loan_ptr_d_.empty() ? nullptr : loan_ptr_d_[(size_t) device_index]; }
     void apply_loans(int il, void* stream);        ///< the pending slot table updates of layer il (on the layer's device, before its grouping)
     void reset_loans();                            ///< every loan dropped (the host syncs the devices first)
+    /// more loan slots carved from a device buffer the decode windows leave idle (bytes [skip, bytes) of base; a prompt
+    /// window drops every loan before it uses the buffer); finalize_loans() uploads the tables once all are added
+    void add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip);
+    void finalize_loans();
     uint64_t loan_hits() const { return loan_hits_; }
     uint64_t loans_made() const { return loans_made_; }
 
@@ -221,6 +225,7 @@ private:
     // the loan pool, per device: slot j = loan_ptr_h_[di][j] (loan_stride_ bytes), its holder (layer, expert) and last window
     bool loan_on_ = false;
     uint64_t loan_stride_ = 0;
+    std::vector<int> loan_ring_n_;                                 ///< per device: the slots on the prefetch ring (the rest: scratch regions)
     int loan_per_win_ = 8;
     bool loan_h2d_ = false;
     std::vector<std::vector<uint8_t*>> loan_ptr_h_;
@@ -260,6 +265,9 @@ private:
     float* y_pin_ = nullptr;                             ///< pinned [n_layers][64][n_embd]: the pairs' outputs, DMA source
     float* y_pin_dev_ = nullptr;                         ///< its device pointer (mapped): the rows are read by a kernel, not the copy engine
     int y_pin_rows_ = 0;
+    static constexpr int kCopyDescMax = 512;              ///< served experts per layer the one-launch copy takes (more: a launch each)
+    int32_t* copy_desc_ = nullptr;                        ///< pinned mapped [2][kCopyDescMax][3]: (pinned row, device row, rows) per served expert, by layer parity
+    int32_t* copy_desc_dev_ = nullptr;
     std::vector<uint8_t> seen_;   ///< scratch of serve(): distinct misses
     struct Miss { int e; std::vector<int> toks; int row0; int ff0; };   ///< a CPU-served expert: its tokens (token order), its first pair row in the device buffer, its first row in ff_/hq_/y_pin
     /// the CPU's products for `misses` of layer il (x_rows: the window's MoE inputs, T of them), their rows copied into

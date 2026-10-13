@@ -98,6 +98,8 @@ ExpertStore::~ExpertStore() {
     for (uint8_t* p : stage_host_) if (p) cudaFreeHost(p);
     for (void* p : pinned_) if (p) cudaFreeHost(p);
     for (auto& P : evict_) for (uint8_t* c : P.chunks) cudaFreeHost(c);
+    if (y_pin_) cudaFreeHost(y_pin_);
+    if (copy_desc_) cudaFreeHost(copy_desc_);
 }
 
 // pread is used instead of memcpy from the mapping: a cold mapping faults page by page (observed ~50 MB/s on six
@@ -457,6 +459,15 @@ void flag_kernel(int device, uint32_t* flag_dev, uint32_t tok, void* cs) {
     strata::glm5::write_flag(flag_dev, tok, cs);
     if (cur != device) cudaSetDevice(cur);
 }
+// the loan copies by the shaders when the blob allows it (STRATA_GLM5_LOAN_MEMCPY=1: the copy engine, as before)
+const bool kLoanMemcpy = std::getenv("STRATA_GLM5_LOAN_MEMCPY") && std::atoi(std::getenv("STRATA_GLM5_LOAN_MEMCPY")) != 0;
+void copy_dev_kernel(int device, void* dst, const void* src, size_t bytes, void* ls) {
+    int cur = 0;
+    cudaGetDevice(&cur);
+    if (cur != device) cudaSetDevice(device);
+    strata::glm5::copy_dev(dst, src, bytes, ls);
+    if (cur != device) cudaSetDevice(cur);
+}
 }  // namespace
 
 int ExpertStore::prefetch(int il, const int32_t* ids, int n, uint32_t tok, uint32_t* h_flag, uint32_t* flag_dev, int* pf_n, int* pf_e, int* pf_slot,
@@ -724,6 +735,14 @@ void ExpertStore::init_cpu(const Model& m) {
     check(cudaHostAlloc(&p, (size_t) y_pin_rows_ * hp.n_embd * 4, cudaHostAllocPortable | cudaHostAllocMapped), "cudaHostAlloc y_pin");
     y_pin_ = static_cast<float*>(p);
     { void* dp = nullptr; if (cudaHostGetDevicePointer(&dp, p, 0) == cudaSuccess) y_pin_dev_ = static_cast<float*>(dp); else cudaGetLastError(); }
+    if (y_pin_dev_) {   // the copy descriptors (row runs per served expert), two sets by layer parity like the result blocks
+        void* q = nullptr;
+        check(cudaHostAlloc(&q, (size_t) 2 * kCopyDescMax * 3 * 4, cudaHostAllocPortable | cudaHostAllocMapped), "cudaHostAlloc copy desc");
+        copy_desc_ = static_cast<int32_t*>(q);
+        void* dq = nullptr;
+        if (cudaHostGetDevicePointer(&dq, q, 0) == cudaSuccess) copy_desc_dev_ = static_cast<int32_t*>(dq);
+        else { cudaGetLastError(); cudaFreeHost(q); copy_desc_ = nullptr; }
+    }
     std::fprintf(stderr, "glm5 experts: decode misses computed on the CPU (ggml-cpu, %d threads)\n", cpu_threads_);
 }
 
@@ -757,13 +776,11 @@ void ExpertStore::init_loans(int n_layers) {
         const int n = (int) loan_ptr_h_[d].size();
         loan_holder_[d].assign((size_t) n, {-1, -1}); loan_last_used_[d].assign((size_t) n, 0u);
         for (int j = n - 1; j >= 0; --j) loan_free_[d].push_back(j);
-        void* p = nullptr;
-        check(cudaMalloc(&p, (size_t) std::max(n, 1) * sizeof(uint8_t*)), "cudaMalloc loan table");
-        device_allocs_.push_back(p);
-        if (n) check(cudaMemcpy(p, loan_ptr_h_[d].data(), (size_t) n * sizeof(uint8_t*), cudaMemcpyHostToDevice), "loan table");
-        loan_ptr_d_[d] = static_cast<const uint8_t**>(p);
         total += n;
     }
+    loan_ring_n_.assign(devices_.size(), 0);
+    for (size_t d = 0; d < devices_.size(); ++d) loan_ring_n_[d] = (int) loan_ptr_h_[d].size();
+    finalize_loans();
     loan_apply_n_.assign((size_t) n_layers, 0); loan_apply_side_.assign((size_t) n_layers, 0);
     for (int side = 0; side < 2; ++side) loan_apply_dev_[side].assign((size_t) n_layers, nullptr);
     loan_batches_.assign((size_t) n_layers, {});
@@ -790,6 +807,45 @@ void ExpertStore::init_loans(int n_layers) {
     }
     std::fprintf(stderr, "glm5 experts: loan pool: %d slots of %.2f MB on the prefetch ring (decode windows cache their misses there; at most %d per window, %s)\n",
                  total, loan_stride_ / 1e6, loan_per_win_, loan_h2d_ ? "CPU-served misses copied too" : "PCIe-staged misses only");
+}
+
+void ExpertStore::add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip) {
+    if (!loan_on_ || !base) return;
+    size_t di = devices_.size();
+    for (size_t d = 0; d < devices_.size(); ++d) if (devices_[d] == device_ordinal) di = d;
+    if (di == devices_.size()) return;
+    for (size_t off = (skip + 255) / 256 * 256; off + loan_stride_ <= bytes; off += loan_stride_) {
+        loan_ptr_h_[di].push_back(base + off);
+        loan_holder_[di].push_back({-1, -1});
+        loan_last_used_[di].push_back(0u);
+        loan_busy_[di].push_back(0);
+        loan_free_[di].insert(loan_free_[di].begin(), (int) loan_ptr_h_[di].size() - 1);   // (the ring's slots are taken first)
+    }
+}
+
+// the device tables (slot -> pointer) from the host lists; called by init_loans and again after regions were added
+void ExpertStore::finalize_loans() {
+    if (!loan_on_) return;
+    int ring = 0, extra = 0;
+    for (size_t d = 0; d < devices_.size(); ++d) {
+        check(cudaSetDevice(devices_[d]), "cudaSetDevice");
+        const int n = (int) loan_ptr_h_[d].size();
+        if (loan_ptr_d_[d]) {
+            for (size_t i = 0; i < device_allocs_.size(); ++i)
+                if (device_allocs_[i] == loan_ptr_d_[d]) { device_allocs_.erase(device_allocs_.begin() + (std::ptrdiff_t) i); break; }
+            check(cudaFree(const_cast<uint8_t**>(loan_ptr_d_[d])), "cudaFree loan table");
+            loan_ptr_d_[d] = nullptr;
+        }
+        void* p = nullptr;
+        check(cudaMalloc(&p, (size_t) std::max(n, 1) * sizeof(uint8_t*)), "cudaMalloc loan table");
+        device_allocs_.push_back(p);
+        if (n) check(cudaMemcpy(p, loan_ptr_h_[d].data(), (size_t) n * sizeof(uint8_t*), cudaMemcpyHostToDevice), "loan table");
+        loan_ptr_d_[d] = static_cast<const uint8_t**>(p);
+        if (!loan_busy_.empty()) loan_busy_[d].resize((size_t) n, 0);
+        ring += loan_ring_n_.empty() ? n : loan_ring_n_[d];
+        extra += n - (loan_ring_n_.empty() ? n : loan_ring_n_[d]);
+    }
+    if (extra) std::fprintf(stderr, "glm5 experts: loan pool: %d slots on the prefetch ring + %d in the prompt scratch (%.2f GB more)\n", ring, extra, extra * (double) loan_stride_ / 1e9);
 }
 
 int ExpertStore::loan_alloc(size_t di, int il, int e, uint32_t tok) {
@@ -975,9 +1031,14 @@ int ExpertStore::cpu_run(int il, const std::vector<Miss>& misses, int T, const f
         // one kernel reads the whole layer's rows from the mapped pinned block (a kernel launch needs the device current)
         int cur = 0; cudaGetDevice(&cur);
         if (cur != E.device) check(cudaSetDevice(E.device), "cudaSetDevice");
+        const float* src = y_pin_dev_ + (size_t) ((il & 1) * y_rows_) * n_embd;
+        if (copy_desc_dev_ && misses.size() <= (size_t) kCopyDescMax) {   // one launch: the served experts' row runs from a descriptor list
+            int32_t* desc = copy_desc_ + (size_t) (il & 1) * kCopyDescMax * 3;
+            for (size_t i = 0; i < misses.size(); ++i) { desc[3 * i] = misses[i].ff0; desc[3 * i + 1] = misses[i].row0; desc[3 * i + 2] = (int32_t) misses[i].toks.size(); }
+            strata::glm5::copy_host_rows_multi(src, y_dev, copy_desc_dev_ + (size_t) (il & 1) * kCopyDescMax * 3, (int) misses.size(), n_embd, cs);
+        } else
         for (const Miss& ms : misses)
-            strata::glm5::copy_host_rows(y_pin_dev_ + (size_t) ((il & 1) * y_rows_) * n_embd + (size_t) ms.ff0 * n_embd, y_dev + (size_t) ms.row0 * n_embd,
-                                         ms.toks.size() * (size_t) n_embd, cs);
+            strata::glm5::copy_host_rows(src + (size_t) ms.ff0 * n_embd, y_dev + (size_t) ms.row0 * n_embd, ms.toks.size() * (size_t) n_embd, cs);
         if (cur != E.device) check(cudaSetDevice(cur), "cudaSetDevice");
     } else
     for (const Miss& ms : misses)
@@ -1194,7 +1255,8 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
                     check(cudaEventRecord(se, cs), "loan stage event"); check(cudaStreamWaitEvent(ls, se, 0), "loan stage wait");
                     loan_event_done(di, se); staged_any = true;
                 }
-                check(cudaMemcpyAsync(dst, stage_[di] + i * stage_slot_bytes_[di], E.blob, cudaMemcpyDeviceToDevice, ls), "loan d2d");
+                if (!kLoanMemcpy && E.blob % 16 == 0) copy_dev_kernel(E.device, dst, stage_[di] + i * stage_slot_bytes_[di], E.blob, ls);
+                else check(cudaMemcpyAsync(dst, stage_[di] + i * stage_slot_bytes_[di], E.blob, cudaMemcpyDeviceToDevice, ls), "loan d2d");
             }
             copy_bytes_ += E.blob;
             batch.adds.emplace_back(e, j);

@@ -54,6 +54,15 @@ const int kIdxPad = std::getenv("STRATA_GLM5_LOD_IDXPAD") ? std::atoi(std::geten
 const int kDenseAttnMaxKv = std::getenv("STRATA_GLM5_ATTN_MAXKV") ? std::max(512, std::atoi(std::getenv("STRATA_GLM5_ATTN_MAXKV")) / 512 * 512) : 16384;
 const bool kNoDenseAttn = std::getenv("STRATA_GLM5_NODENSEATTN") != nullptr;
 constexpr int kGemmMinT = 16;    // windows at least this wide take the tensor-core GEMM for the dense weights
+constexpr int kQkvFuseT = 64;    // windows up to this many rows take the KDA q | k | v projections as one product ([T][3 D] scratch)
+constexpr int kFabT = 16;
+constexpr int kShT = 64;         // decode windows up to this many rows keep the shared experts' scratch apart from the pairs' (the early order)
+static const bool kQ8Fuse = !std::getenv("STRATA_GLM5_Q8_FUSE") || std::atoi(std::getenv("STRATA_GLM5_Q8_FUSE")) != 0;   // 0: the producers do not quantize (a separate quantize per Q8_0 product)
+static const bool kPackFuse = !std::getenv("STRATA_GLM5_PACK_FUSE") || std::atoi(std::getenv("STRATA_GLM5_PACK_FUSE")) != 0;   // 0: the sums packed by a separate launch
+static const bool kRollbackTable = !std::getenv("STRATA_GLM5_ROLLBACK_TABLE") || std::atoi(std::getenv("STRATA_GLM5_ROLLBACK_TABLE")) != 0;   // 0: the rollback as memcpys
+static const bool kNarrowBf16 = !std::getenv("STRATA_GLM5_NARROW_BF16") || std::atoi(std::getenv("STRATA_GLM5_NARROW_BF16")) != 0;   // 0: the generic BF16 kernel for narrow weights
+static const bool kMoeEarly = !std::getenv("STRATA_GLM5_MOE_EARLY") || std::atoi(std::getenv("STRATA_GLM5_MOE_EARLY")) != 0;   // 0: the resident down products and shared experts after the wait
+static const bool kMhcDec = !std::getenv("STRATA_GLM5_MHC_DEC") || std::atoi(std::getenv("STRATA_GLM5_MHC_DEC")) != 0;   // 0: the separate mHC kernels for small windows        // ... and the f_a | g_a | beta ones (the verify windows; the scratch is this many rows)
 constexpr int kPrefetchAllMinT = 256;   // prompt windows at least this wide prefetch every non-resident expert (42 GB per window here)
 constexpr int kMmqMinT = 9;      // ... and the MMQ expert path (int8 tensor cores); the verify windows (<= 8) keep the exact grouped MMVQ
 const bool kNoMmq = std::getenv("STRATA_GLM5_NOMMQ") != nullptr;
@@ -106,6 +115,8 @@ void* Engine::alloc_mapped(uint64_t bytes, int ordinal, void** dev_view) {
 }
 
 Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_(m.hp()), max_ctx_(max_ctx), t_max_(t_max), n_slots_(std::max(0, n_slots)) {
+    if (std::getenv("STRATA_GLM5_MMVQ_UPSTREAM") && std::atoi(std::getenv("STRATA_GLM5_MMVQ_UPSTREAM")) != 0)
+        strata::kernels::native_mmvq_set_multi_exact(false);   // llama.cpp's multi-column layout (two rows per block; equal to one column to rounding)
     cur_slot_ = n_slots_;
     mtp_slot_ = n_slots_;
     // (a window wider than a chunk is wired - the layer loop runs chunk by chunk - but off: prefill is compute-bound now, a 4096
@@ -195,16 +206,28 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
         check(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
         d.event = ev;
         auto f = [&](uint64_t n) { return static_cast<float*>(alloc(n * 4, ordinal)); };
+        // the prompt scratch a decode window (<= 8 rows) leaves idle is lent to the decode-time expert cache: a buffer
+        // whole, or past the rows a decode window writes (16 rows' worth, at least 4 MB; the lender keeps that head)
+        auto lend = [&](void* p, uint64_t bytes, uint64_t row_bytes) {
+            if (p && bytes) d.lend.push_back({static_cast<uint8_t*>(p), bytes, row_bytes ? std::max<uint64_t>(16 * row_bytes, 4u << 20) : 0});
+        };
         d.R = f((uint64_t) TS * hp_.hc * E);
         d.x = f((uint64_t) TS * E); d.xn = f((uint64_t) T * E); d.y = f((uint64_t) T * E);
         d.mixes = f((uint64_t) T * hp_.hc_mix_dim()); d.part = f((uint64_t) T * hp_.hc_mix_dim() * mhc_mix_slices()); d.rs = f(T);
         d.pre = f((uint64_t) T * hp_.hc); d.post = f((uint64_t) T * hp_.hc); d.comb = f((uint64_t) T * hp_.hc * hp_.hc);
         d.big_a = f((uint64_t) T * big); d.big_b = f((uint64_t) T * big); d.big_c = f((uint64_t) T * big); d.big_d = f((uint64_t) T * big);
+        for (float* b : {d.big_a, d.big_b, d.big_c, d.big_d}) lend(b, (uint64_t) T * big * 4, (uint64_t) big * 4);
+        d.qkv = f((uint64_t) std::min(T, kQkvFuseT) * 3 * D); d.fab = f((uint64_t) kFabT * (2 * hp_.kda_head_dim + hp_.n_head));
+        d.sh_g = f((uint64_t) std::min(T, kShT) * 2 * FF * std::max(1, hp_.n_expert_shared)); d.sh_h = f((uint64_t) std::min(T, kShT) * FF * std::max(1, hp_.n_expert_shared));
+        d.q8_sh = static_cast<uint8_t*>(alloc((uint64_t) std::min(T, kShT) * q8_cols(FF * std::max(1, hp_.n_expert_shared)), ordinal));
+        d.dense_gu = f((uint64_t) std::min(T, kShT) * 2 * hp_.n_ff);
         const int sm = std::max(hp_.q_lora, hp_.kv_lora);
         d.small_a = f((uint64_t) T * sm); d.small_b = f((uint64_t) T * sm);
         const uint64_t ffrows = std::max<uint64_t>((uint64_t) pairs_alloc_ * FF, (uint64_t) T * std::max(hp_.n_ff, FF * std::max(1, hp_.n_expert_shared)));
         d.ffn_g = f(ffrows); d.ffn_u = f(ffrows); d.ffn_h = f(ffrows);
+        for (float* b : {d.ffn_g, d.ffn_u, d.ffn_h}) lend(b, ffrows * 4, (uint64_t) std::max(hp_.n_ff, K * FF) * 4);
         d.ffn_y = f((uint64_t) pairs_alloc_ * E); d.ffn_acc = f((uint64_t) T * E); d.ffn_d = f((uint64_t) T * E);
+        lend(d.ffn_y, (uint64_t) pairs_alloc_ * E * 4, (uint64_t) K * E * 4);
         d.logits = f(std::max((uint64_t) snap_T_ * hp_.n_vocab, (uint64_t) T * hp_.n_expert));   // the verify window's full logits; a prompt window keeps the last token's only
         d.probs = f((uint64_t) T * hp_.n_expert); d.wts = f((uint64_t) T * K);
         d.h_win = f((uint64_t) TS * E);
@@ -212,12 +235,17 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
         d.q8_x = static_cast<uint8_t*>(alloc((uint64_t) T * q8_cols(E), ordinal));
         d.q8_g = static_cast<uint8_t*>(alloc((uint64_t) max_pairs_ * q8_cols(E), ordinal));
         d.q8_h = static_cast<uint8_t*>(alloc((uint64_t) max_pairs_ * q8_cols(FF), ordinal));
+        lend(d.q8_g, (uint64_t) max_pairs_ * q8_cols(E), (uint64_t) K * q8_cols(E));
+        lend(d.q8_h, (uint64_t) max_pairs_ * q8_cols(FF), (uint64_t) q8_cols(hp_.n_ff));
         d.q8_big = static_cast<uint8_t*>(alloc((uint64_t) T * q8_cols(big), ordinal));
         d.q_abs = f((uint64_t) T * hp_.n_head * hp_.kv_lora);
+        lend(d.q_abs, (uint64_t) T * hp_.n_head * hp_.kv_lora * 4, (uint64_t) hp_.n_head * hp_.kv_lora * 4);
         d.iq = f((uint64_t) T * hp_.idx_heads * hp_.idx_dim); d.ik = f((uint64_t) T * hp_.idx_dim); d.ig = f((uint64_t) T * hp_.idx_dim); d.iw = f((uint64_t) T * hp_.idx_heads);
         d.score = f((uint64_t) kDsaBatch * ((uint64_t) max_ctx / hp_.kpool + 1));
         d.attn_scores = f((uint64_t) kDsaBatch * hp_.n_head * n_sel_max);
+        lend(d.attn_scores, (uint64_t) kDsaBatch * hp_.n_head * n_sel_max * 4, (uint64_t) hp_.n_head * n_sel_max * 4);
         d.ctx = f((uint64_t) T * hp_.n_head * hp_.kv_lora);
+        lend(d.ctx, (uint64_t) T * hp_.n_head * hp_.kv_lora * 4, (uint64_t) hp_.n_head * hp_.kv_lora * 4);
         d.sel = static_cast<int32_t*>(alloc((uint64_t) kDsaBatch * n_sel_max * 4, ordinal));
         d.sel_params = static_cast<int*>(alloc((uint64_t) T * 8 * 4, ordinal));
         d.expert_stage = nullptr;   // the no-store path allocates it on first use (min(max_pairs, n_expert) slots)
@@ -234,6 +262,7 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
         check(cudaMemset(d.pair_tok, 0, (uint64_t) pairs_alloc_ * 4), "pair_tok");
         d.pair_w = f(max_pairs_);
         d.cnt = static_cast<int*>(alloc(8 * 4, ordinal));
+        d.copy_cap = 4 * NL + 4;   // (the rollback table itself is made at the first rollback)
         d.grp_e = static_cast<int*>(alloc((uint64_t) max_pairs_ * 4, ordinal));
         d.grp_miss = static_cast<int*>(alloc((uint64_t) max_pairs_ * 4, ordinal));
         d.argmax_out = static_cast<int32_t*>(alloc((uint64_t) T * 4, ordinal));
@@ -251,6 +280,8 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
             if (!g->init(d.stream, (int64_t) big * E, err)) throw std::runtime_error("glm5: prefill gemm: " + err);
             d.gemm = g;
             d.x16 = static_cast<uint16_t*>(alloc((uint64_t) T * big * 2, ordinal));
+            lend(d.x16, (uint64_t) T * big * 2, 0);
+            lend(g->scratch(), (uint64_t) g->scratch_elems() * 2, 0);
             // the BLAS library's first call costs ~170 ms (its kernel library loads): paid here, not by the first request
             check(cudaMemsetAsync(d.x16, 0, 64 * 64 * 2 * 2, S(d.stream)), "warm-up memset");
             g->bf16(d.x16, d.x16 + 64 * 64, d.big_a, 16, 64, 64);
@@ -274,8 +305,10 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
                 d.mmq_xq = alloc(strata::prefill::mmq::q8_bytes(pairs_alloc_, E), ordinal);
                 d.mmq_xq_h = alloc(strata::prefill::mmq::q8_bytes(pairs_alloc_, FF), ordinal);
                 d.gu_out = f((uint64_t) pairs_alloc_ * 2 * FF);
+                lend(d.gu_out, (uint64_t) pairs_alloc_ * 2 * FF * 4, 0);
                 if (!(std::getenv("STRATA_GLM5_NOQ2K") && std::atoi(std::getenv("STRATA_GLM5_NOQ2K")) != 0)) {   // the Q2_K expert products on WMMA (gfx11); STRATA_GLM5_NOQ2K=1: the MMQ path
                     d.q2k_codes = static_cast<int8_t*>(alloc((uint64_t) pairs_alloc_ * E, ordinal));
+                    lend(d.q2k_codes, (uint64_t) pairs_alloc_ * E, (uint64_t) K * E);
                     d.q2k_scales = f((uint64_t) pairs_alloc_ * (E / 256));
                     d.q2k_sums = static_cast<int32_t*>(alloc((uint64_t) pairs_alloc_ * (E / 16) * 4, ordinal));
                     // the decode windows (at most 64 pairs) on the same kernel family: packed sums, and the swiglu rows' operands
@@ -289,14 +322,17 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
                 { std::vector<int32_t> h((size_t) pairs_alloc_); std::iota(h.begin(), h.end(), 0); check(cudaMemcpy(d.iota, h.data(), h.size() * 4, cudaMemcpyHostToDevice), "iota"); }
                 d.bounds = static_cast<int*>(alloc((uint64_t) (hp_.n_expert + 1) * 4, ordinal));
                 d.mmq_xd = alloc(strata::prefill::mmq::q8_bytes(T + 256, big), ordinal);
+                lend(d.mmq_xd, strata::prefill::mmq::q8_bytes(T + 256, big), 0);
                 d.dense_bounds = static_cast<int32_t*>(alloc(8, ordinal));
                 d.dense_bounds_h = static_cast<int32_t*>(alloc_host(64));
                 d.head_xq = alloc(strata::prefill::mmq::q8_bytes((int64_t) T * hp_.n_head + 256, std::max(hp_.head_k_mla, hp_.kv_lora)), ordinal);
+                lend(d.head_xq, strata::prefill::mmq::q8_bytes((int64_t) T * hp_.n_head + 256, std::max(hp_.head_k_mla, hp_.kv_lora)), 0);
                 d.head_ids = static_cast<int32_t*>(alloc((uint64_t) T * hp_.n_head * 4, ordinal));
                 d.head_bounds = static_cast<int32_t*>(alloc((uint64_t) (hp_.n_head + 1) * 4, ordinal));
                 {
                     const int64_t rows = (int64_t) kDsaBatch * hp_.n_head, npad = kDenseAttnMaxKv, KV = hp_.kv_lora;
                     d.kvcT_q8 = static_cast<uint8_t*>(alloc((uint64_t) KV * (npad / 32) * 34, ordinal));
+                    lend(d.kvcT_q8, (uint64_t) KV * (npad / 32) * 34, 0);
                     if (lod_.on) {
                         d.lod_kv_q8 = static_cast<uint8_t*>(alloc((uint64_t) (npad + 512) * q8_pitch(KV), ordinal));
                         d.lod_bias = f((uint64_t) npad + 512);
@@ -309,9 +345,12 @@ Engine::Engine(const Model& m, int max_ctx, int t_max, int n_slots) : m_(m), hp_
                         d.sel_params2 = static_cast<int*>(alloc((uint64_t) T * 8 * 4, ordinal));
                     }
                     d.attn_S = f((uint64_t) rows * npad);
+                    lend(d.attn_S, (uint64_t) rows * npad * 4, 0);
                     d.attn_mask = static_cast<uint32_t*>(alloc((uint64_t) kDsaBatch * (npad / 32) * 4, ordinal));
                     d.attn_xq = alloc(strata::prefill::mmq::q8_bytes(rows + 256, KV), ordinal);
+                    lend(d.attn_xq, strata::prefill::mmq::q8_bytes(rows + 256, KV), 0);
                     d.attn_pq = alloc(strata::prefill::mmq::q8_bytes(rows + 256, npad), ordinal);
+                    lend(d.attn_pq, strata::prefill::mmq::q8_bytes(rows + 256, npad), 0);
                     d.attn_bounds = static_cast<int32_t*>(alloc(8, ordinal));
                     d.attn_bounds_h = static_cast<int32_t*>(alloc_host(64));
                 }
@@ -615,10 +654,21 @@ bool Engine::restore_mark(int slot) {
 
 // y[T][n_out] = W x[T][n_in]: Q8_0 through the pinned MMVQ (Q8_1 activations, columns bitwise equal to single calls),
 // BF16 and F32 in FP32 with the same per-column arithmetic as the single-token kernels
-void Engine::gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, int n_in, int n_out) {
+// rows [r0, r0 + n) of a row-contiguous weight as a tensor of their own
+static DevTensor row_slice(const DevTensor& w, int64_t r0, int64_t n) {
+    DevTensor v = w;
+    const uint64_t rb = w.bytes / (uint64_t) w.ne1;
+    v.data = static_cast<uint8_t*>(w.data) + (uint64_t) r0 * rb;
+    v.bytes = (uint64_t) n * rb;
+    v.ne1 = n;
+    return v;
+}
+
+void Engine::gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, int n_in, int n_out, int ldx) {
     if ((int) w.ne0 != n_in || (int) w.ne1 != n_out)
         throw std::runtime_error("gemv: tensor is [" + std::to_string(w.ne0) + "," + std::to_string(w.ne1) + "], wanted [" +
                                  std::to_string(n_in) + "," + std::to_string(n_out) + "]");
+    if (ldx && ldx != n_in && (w.type != T_BF16 || T >= kGemmMinT)) throw std::runtime_error("gemv: a strided input needs the small BF16 kernel");
     if (w.type == T_F32) {
         if (T >= kGemmMinT && d.gemm && (int64_t) n_in * n_out <= static_cast<strata::prefill::Gemm*>(d.gemm)->scratch_elems()) {
             // the F32 weight (the router) rounded to FP16 into the GEMM scratch, like a dequantized one
@@ -669,7 +719,9 @@ void Engine::gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, i
         const int Tc = std::min(8, T - t0);
         const float* xc = x + (size_t) t0 * n_in;
         float* yc = y + (size_t) t0 * n_out;
-        if (w.type == T_BF16) strata::kernels::bf16_gemv_fp32_mmvf_multi(xc, n_in, w.bf16(), yc, n_out, n_in, n_out, Tc, d.stream);
+        if (w.type == T_BF16 && n_in <= 256 && n_in % 8 == 0 && kNarrowBf16)
+            bf16_gemv_narrow_t(x + (size_t) t0 * (ldx ? ldx : n_in), ldx ? ldx : n_in, w.bf16(), yc, n_in, n_out, Tc, d.stream);
+        else if (w.type == T_BF16) strata::kernels::bf16_gemv_fp32_mmvf_multi(x + (size_t) t0 * (ldx ? ldx : n_in), ldx ? ldx : n_in, w.bf16(), yc, n_out, n_in, n_out, Tc, d.stream);
         else {
             strata::kernels::native_quantize_q8_1(xc, d.q8_big, n_in, Tc, d.stream);
             strata::kernels::native_mmvq((int) w.type, w.data, d.q8_big, yc, n_in, n_out, Tc, d.stream);
@@ -677,10 +729,32 @@ void Engine::gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, i
     }
 }
 
+// a quantized weight on q8_1 rows a producer kernel wrote (the decode windows: up to 8 columns per launch)
+void Engine::gemv_q8(Dev& d, int T, const DevTensor& w, const uint8_t* xq, float* y, int n_in, int n_out) {
+    if ((int) w.ne0 != n_in || (int) w.ne1 != n_out) throw std::runtime_error("gemv_q8: tensor shape mismatch");
+    if (T > 8 || !strata::kernels::native_mmvq_supported((int) w.type)) throw std::runtime_error("gemv_q8: a decode window on a quantized weight only");
+    strata::kernels::native_mmvq((int) w.type, w.data, xq, y, n_in, n_out, T, d.stream);
+}
+
 void Engine::mhc(Dev& d, int T, const float* R, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, float* x) {
     mhc_mix_t(R, fn.f32(), scale.f32(), base.f32(), d.mixes, d.part, d.rs, d.pre, d.post, d.comb, T, hp_.n_embd, hp_.hc,
               hp_.hc_iters, hp_.rms_eps, hp_.hc_eps, d.stream);
     mhc_pre_apply_t(R, d.pre, x, T, hp_.n_embd, hp_.hc, d.stream);
+}
+
+// the pre-mix and the norm that follows it: a verify / decode window in two launches, a wider one on the separate kernels
+void Engine::mhc_norm(Dev& d, int T, const float* R, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const DevTensor& norm,
+                      float* x, float* xn) {
+    d.xn_q8 = nullptr;
+    if (T <= 8 && kMhcDec) {
+        uint8_t* xq = kQ8Fuse && xn == d.xn ? d.q8_x : nullptr;   // the Q8_0 products from xn take these rows instead of quantizing again
+        mhc_dec_t(R, fn.f32(), scale.f32(), base.f32(), d.mixes, d.part, d.pre, d.post, d.comb, norm.f32(), x, xn, xq, T, hp_.n_embd, hp_.hc,
+                  hp_.hc_iters, hp_.rms_eps, hp_.hc_eps, d.stream);
+        d.xn_q8 = xq;
+        return;
+    }
+    mhc(d, T, R, fn, scale, base, x);
+    rms_norm(x, norm.f32(), xn, T, hp_.n_embd, hp_.rms_eps, d.stream);
 }
 
 void Engine::kda_layer(Dev& d, int il, int T, const float* xn, float* out, const DumpFn& dump) {
@@ -691,42 +765,74 @@ void Engine::kda_layer(Dev& d, int il, int T, const float* xn, float* out, const
     float* csnap = T <= snap_T_ ? conv_snap_[(size_t) il] : nullptr;
     const int cs_stride = (hp_.d_conv - 1) * D, snap_stride = T * (hp_.d_conv - 1) * D;
     float *q = d.big_a, *k = d.big_b, *v = d.big_c, *tmp = d.big_d;
+    const Ptr3 qkv{{q, k, v}};
     if (rows_mode_) {   // runs of rows per slot on the slot's conv state, with per-row snapshots for the rollback
+        if (T > kQkvFuseT) throw std::runtime_error("kda_layer: too many rows for the fused product");
         float* rsnap = conv_snap_[(size_t) il];
-        const size_t rs = (size_t) T * (hp_.d_conv - 1) * D;
-        gemv(d, T, L.wq, xn, tmp, E, D); kda_conv_grp(tmp, conv_tab_[(size_t) il], d.row_slot_d, d.row_k_d, 0, L.conv_q.f32(), q, rsnap, D, hp_.d_conv, T, d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, d.stream);
-        gemv(d, T, L.wk, xn, tmp, E, D); kda_conv_grp(tmp, conv_tab_[(size_t) il], d.row_slot_d, d.row_k_d, 1, L.conv_k.f32(), k, rsnap ? rsnap + rs : nullptr, D, hp_.d_conv, T, d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, d.stream);
-        gemv(d, T, L.wv, xn, tmp, E, D); kda_conv_grp(tmp, conv_tab_[(size_t) il], d.row_slot_d, d.row_k_d, 2, L.conv_v.f32(), v, rsnap ? rsnap + 2 * rs : nullptr, D, hp_.d_conv, T, d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, d.stream);
-    } else {
-    gemv(d, T, L.wq, xn, tmp, E, D); kda_conv_silu_t(tmp, cs, L.conv_q.f32(), q, csnap, D, hp_.d_conv, T, d.stream);
-    gemv(d, T, L.wk, xn, tmp, E, D); kda_conv_silu_t(tmp, cs + cs_stride, L.conv_k.f32(), k, csnap ? csnap + snap_stride : nullptr, D, hp_.d_conv, T, d.stream);
-    gemv(d, T, L.wv, xn, tmp, E, D); kda_conv_silu_t(tmp, cs + 2 * cs_stride, L.conv_v.f32(), v, csnap ? csnap + 2 * snap_stride : nullptr, D, hp_.d_conv, T, d.stream);
+        gemv(d, T, L.wqkv, xn, d.qkv, E, 3 * D);
+        kda_conv_grp(d.qkv, 3 * D, 3, conv_tab_[(size_t) il], d.row_slot_d, d.row_k_d, L.conv_qkv.f32(), qkv, rsnap, snap_stride, D, hp_.d_conv, T,
+                     d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, d.stream);
+    } else if (T <= kQkvFuseT) {   // q | k | v in one product and one conv launch
+        if (d.xn_q8 && xn == d.xn && T <= 8) gemv_q8(d, T, L.wqkv, d.xn_q8, d.qkv, E, 3 * D);
+        else gemv(d, T, L.wqkv, xn, d.qkv, E, 3 * D);
+        kda_conv_silu_t(d.qkv, 3 * D, 3, cs, cs_stride, L.conv_qkv.f32(), qkv, csnap, snap_stride, D, hp_.d_conv, T, d.stream);
+    } else {   // a prompt window: the three products one at a time (the wide [T][3 D] result would not fit the scratch)
+        for (int sg = 0; sg < 3; ++sg) {
+            gemv(d, T, row_slice(L.wqkv, (int64_t) sg * D, D), xn, tmp, E, D);
+            const Ptr3 one{{qkv.p[sg], nullptr, nullptr}};
+            kda_conv_silu_t(tmp, D, 1, cs + (size_t) sg * cs_stride, 0, L.conv_qkv.f32() + (size_t) sg * D * hp_.d_conv, one,
+                            csnap ? csnap + (size_t) sg * snap_stride : nullptr, 0, D, hp_.d_conv, T, d.stream);
+        }
     }
     prof_mark(d, "kda_qkv");
     if (dump) { dump("kda_q_conv", q, {H, Sd}, false, dv); dump("kda_k_conv", k, {H, Sd}, false, dv); dump("kda_v_conv", v, {H, Sd}, false, dv); }
-    gemv(d, T, L.f_a, xn, d.small_a, E, Sd);
-    gemv(d, T, L.f_b, d.small_a, tmp, Sd, D);
-    float* g1 = d.ffn_g;   // T x D floats, free during the attention half
-    kda_gate_t(tmp, L.dt_b.f32(), L.ssm_a.f32(), hp_.kda_lower, g1, T, H, Sd, d.stream);
-    if (dump) dump("kda_g1", g1, {H, Sd}, false, dv);
-    float* beta = d.ffn_u;
-    gemv(d, T, L.beta, xn, beta, E, H);
-    sigmoid_inplace(beta, T * H, d.stream);
-    if (dump) dump("kda_beta", beta, {H}, false, dv);
-    l2_norm_rows(q, T * H, Sd, 1e-6f, d.stream);
-    l2_norm_rows(k, T * H, Sd, 1e-6f, d.stream);
-    prof_mark(d, "kda_gates");
-    float* o = d.ffn_h;
-    if (rows_mode_) kda_step_grp(ssm_tab_[(size_t) il], d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, q, k, v, g1, beta, o, ssm_snap_[(size_t) il], H, Sd, d.stream);
-    else kda_step_t(ssm_state_[stj(d, il)], q, k, v, g1, beta, o, T <= snap_T_ ? ssm_snap_[(size_t) il] : nullptr, T, H, Sd, d.stream);
-    if (dump) dump("kda_scan_out", o, {H, Sd}, false, dv);
-    prof_mark(d, "kda_scan");
-    gemv(d, T, L.g_a, xn, d.small_a, E, Sd);
-    gemv(d, T, L.g_b, d.small_a, tmp, Sd, D);
-    if (dump) dump("kda_g2", tmp, {H, Sd}, false, dv);
     float *normed = d.big_a, *y = d.big_b;
-    kda_out_gate(o, L.ssm_norm.f32(), tmp, normed, y, T * H, Sd, hp_.rms_eps, d.stream);
-    if (dump) dump("kda_normed", normed, {H, Sd}, false, dv);
+    float* o = d.ffn_h;
+    static const int kKdaFuse = std::getenv("STRATA_GLM5_KDA_FUSE") ? std::atoi(std::getenv("STRATA_GLM5_KDA_FUSE")) : 1;   // 0: the separate scan / gate kernels
+    if (kKdaFuse && !rows_mode_ && T <= 8 && T < kGemmMinT && T <= kFabT && !dump) {
+        normed = d.ffn_u; y = d.ffn_y;   // (the fused kernel reads q and k while it writes these: other buffers)
+        // the verify / decode window: f_a | g_a | beta as one product ([T][2 S + H]: the f_b / g_b inputs and beta at
+        // row stride 2 S + H), then the scan with its gates, norms and output gate in one launch
+        const int ldf = 2 * Sd + H;
+        gemv(d, T, L.fab, xn, d.fab, E, ldf);
+        gemv(d, T, L.f_b, d.fab, tmp, Sd, D, ldf);            // the gate's input
+        float* g2 = d.ffn_g;                                  // T x D floats, free during the attention half
+        gemv(d, T, L.g_b, d.fab + Sd, g2, Sd, D, ldf);        // the output gate
+        prof_mark(d, "kda_gates");
+        uint8_t* yq = kQ8Fuse ? d.q8_big : nullptr;   // y's q8_1 rows for the output projection ([T][q8_cols(D)], the gemv scratch's layout)
+        kda_step_fused(ssm_state_[stj(d, il)], q, k, v, tmp, L.dt_b.f32(), L.ssm_a.f32(), hp_.kda_lower, d.fab + 2 * Sd, ldf, L.ssm_norm.f32(), g2,
+                       o, normed, y, yq, T <= snap_T_ ? ssm_snap_[(size_t) il] : nullptr, T, H, Sd, 1e-6f, hp_.rms_eps, d.stream);
+        prof_mark(d, "kda_scan");
+        if (yq) {
+            gemv_q8(d, T, L.wo, yq, out, D, E);
+            prof_mark(d, "kda_out");
+            if (dump) dump("kda_out", out, {E}, false, dv);
+            return;
+        }
+    } else {
+        const DevTensor f_a = row_slice(L.fab, 0, Sd), g_a = row_slice(L.fab, Sd, Sd), beta_w = row_slice(L.fab, 2 * Sd, H);
+        gemv(d, T, f_a, xn, d.small_a, E, Sd);
+        gemv(d, T, L.f_b, d.small_a, tmp, Sd, D);
+        float* g1 = d.ffn_g;   // T x D floats, free during the attention half
+        kda_gate_t(tmp, L.dt_b.f32(), L.ssm_a.f32(), hp_.kda_lower, g1, T, H, Sd, d.stream);
+        if (dump) dump("kda_g1", g1, {H, Sd}, false, dv);
+        float* beta = d.ffn_u;
+        gemv(d, T, beta_w, xn, beta, E, H);
+        sigmoid_inplace(beta, T * H, d.stream);
+        if (dump) dump("kda_beta", beta, {H}, false, dv);
+        l2_norm_rows(q, T * H, Sd, 1e-6f, d.stream);
+        l2_norm_rows(k, T * H, Sd, 1e-6f, d.stream);
+        prof_mark(d, "kda_gates");
+        if (rows_mode_) kda_step_grp(ssm_tab_[(size_t) il], d.grp_slot_d, d.grp_start_d, d.grp_len_d, n_grp_, q, k, v, g1, beta, o, ssm_snap_[(size_t) il], H, Sd, d.stream);
+        else kda_step_t(ssm_state_[stj(d, il)], q, k, v, g1, beta, o, T <= snap_T_ ? ssm_snap_[(size_t) il] : nullptr, T, H, Sd, d.stream);
+        if (dump) dump("kda_scan_out", o, {H, Sd}, false, dv);
+        prof_mark(d, "kda_scan");
+        gemv(d, T, g_a, xn, d.small_a, E, Sd);
+        gemv(d, T, L.g_b, d.small_a, tmp, Sd, D);
+        if (dump) dump("kda_g2", tmp, {H, Sd}, false, dv);
+        kda_out_gate(o, L.ssm_norm.f32(), tmp, normed, y, T * H, Sd, hp_.rms_eps, d.stream);
+        if (dump) dump("kda_normed", normed, {H, Sd}, false, dv);
+    }
     gemv(d, T, L.wo, y, out, D, E);
     prof_mark(d, "kda_out");
     if (dump) dump("kda_out", out, {E}, false, dv);
@@ -942,7 +1048,8 @@ void Engine::dsa_layer(Dev& d, int il, int T, int pos0, const float* xn, float* 
     const int dv = d.ordinal;
     cudaStream_t s = S(d.stream);
     const int n_sel_max = n_sel_max_;
-    gemv(d, T, L.q_a, xn, d.small_a, E, hp_.q_lora);
+    if (d.xn_q8 && xn == d.xn && T <= 8) gemv_q8(d, T, L.q_a, d.xn_q8, d.small_a, E, hp_.q_lora);
+    else gemv(d, T, L.q_a, xn, d.small_a, E, hp_.q_lora);
     if (kDebugSync) debug_sync(d.stream, il, "q_a");
     float* qr = d.small_b;
     rms_norm(d.small_a, L.q_a_norm.f32(), qr, T, hp_.q_lora, hp_.rms_eps, d.stream);
@@ -1122,10 +1229,19 @@ void Engine::predict_next(Dev& d, int il, int T, const float* xn) {
 void Engine::dense_ffn(Dev& d, int il, int T, const float* xn, float* out, const DumpFn& dump) {
     const LayerWeights& L = m_.layer(il);
     const int E = hp_.n_embd, FF = hp_.n_ff;
-    gemv(d, T, L.ffn_gate, xn, d.ffn_g, E, FF);
-    gemv(d, T, L.ffn_up, xn, d.ffn_u, E, FF);
-    swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * FF, hp_.clamp_shexp[(size_t) il], d.stream);
-    gemv(d, T, L.ffn_down, d.ffn_h, out, FF, E);
+    if (T <= kShT) {   // gate | up as one product; the swiglu quantizes h for the down projection
+        if (d.xn_q8 && xn == d.xn && T <= 8) gemv_q8(d, T, L.ffn_gu, d.xn_q8, d.dense_gu, E, 2 * FF);
+        else gemv(d, T, L.ffn_gu, xn, d.dense_gu, E, 2 * FF);
+        uint8_t* hq = kQ8Fuse && T <= 8 && FF % 32 == 0 ? d.q8_h : nullptr;   // ([T][q8_cols(FF)]: the pair buffer holds max_pairs_ such rows)
+        swiglu_clamp_gu_t(d.dense_gu, d.ffn_h, T, FF, hp_.clamp_shexp[(size_t) il], d.stream, hq);
+        if (hq) gemv_q8(d, T, L.ffn_down, hq, out, FF, E);
+        else gemv(d, T, L.ffn_down, d.ffn_h, out, FF, E);
+    } else {
+        gemv(d, T, row_slice(L.ffn_gu, 0, FF), xn, d.ffn_g, E, FF);
+        gemv(d, T, row_slice(L.ffn_gu, FF, FF), xn, d.ffn_u, E, FF);
+        swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * FF, hp_.clamp_shexp[(size_t) il], d.stream);
+        gemv(d, T, L.ffn_down, d.ffn_h, out, FF, E);
+    }
     if (dump) dump("ffn_out", out, {E}, false, d.ordinal);
 }
 
@@ -1281,8 +1397,6 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
                           hp_.expert_scale, d.ids, d.wts, d.probs, d.stream);
     if (dump) { dump("ffn_moe_probs", d.probs, {hp_.n_expert}, false, dv); dump("ffn_moe_topk", d.ids, {K}, true, dv); dump("ffn_moe_weights", d.wts, {K, 1}, false, dv); }
     if (kDebugSync) debug_sync(d.stream, il, "router");
-    strata::kernels::native_quantize_q8_1(xn, d.q8_x, E * T, 1, d.stream);   // T contiguous rows as one vector (blocks of 32 stay inside a row)
-    if (kDebugSync) debug_sync(d.stream, il, "quantize");
     const int32_t* slot_of = d.neg_table;
     const uint8_t* slots = nullptr;
     const uint8_t* stage = nullptr;
@@ -1328,9 +1442,13 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     const bool decq2k = d.q2k_packed && !kNoDecQ2K && rows_max <= 64 && L.exp_gate.type == 10 && L.exp_up.type == 10 && L.exp_down.type == 10 &&
                         FF % 128 == 0 && E % 256 == 0 && FF % 256 == 0 && E % 128 == 0;
     if (decq2k) {
-        strata::glm5::q2k::quantize_act(xn, d.pair_tok, rows_max, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream);
-        strata::glm5::q2k::pack_sums(d.q2k_sums, rows_max, E, d.q2k_packed, d.stream);
-    } else gather_q8(d.q8_x, d.pair_tok, d.cnt + 2, d.q8_g, (int) col_e, rows_max, d.stream);
+        strata::glm5::q2k::quantize_act(xn, d.pair_tok, rows_max, E, d.q2k_codes, d.q2k_scales, d.q2k_sums, d.stream, nullptr, nullptr, kPackFuse ? d.q2k_packed : nullptr);
+        if (!kPackFuse) strata::glm5::q2k::pack_sums(d.q2k_sums, rows_max, E, d.q2k_packed, d.stream);
+    } else {
+        if (!(d.xn_q8 == d.q8_x && xn == d.xn))   // (the kernel that wrote xn may have quantized it into q8_x already)
+            strata::kernels::native_quantize_q8_1(xn, d.q8_x, E * T, 1, d.stream);   // T contiguous rows as one vector (blocks of 32 stay inside a row)
+        gather_q8(d.q8_x, d.pair_tok, d.cnt + 2, d.q8_g, (int) col_e, rows_max, d.stream);
+    }
     if (kDebugSync) debug_sync(d.stream, il, "gather");
     prof_mark(d, "router+group");
     if (!doorbell && !all_resident) {
@@ -1372,6 +1490,26 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     };
     gate_up(g0, d.cnt);
     prof_mark(d, "moe_hits");
+    const int SF = FF * std::max(1, hp_.n_expert_shared);
+    // the shared experts (from xn alone) and the resident experts' down products go before the wait on the served
+    // misses: the GPU computes them while the CPU serves (a decode round waits ~50 ms there), and the misses' rows
+    // (pair rows [cnt[6], cnt[2]), groups [cnt[0], cnt[1])) follow the wait
+    const bool early = kMoeEarly && doorbell && decq2k && !all_resident && !dump && T <= kShT;
+    auto shared_experts = [&](float* g_buf, float* h_buf) {
+        if (d.xn_q8 && xn == d.xn && T <= 8) gemv_q8(d, T, L.sh_gu, d.xn_q8, g_buf, E, 2 * SF);
+        else gemv(d, T, L.sh_gu, xn, g_buf, E, 2 * SF);   // gate | up as one product (one launch, twice the rows per launch)
+        uint8_t* hq = kQ8Fuse && T <= 8 && SF % 32 == 0 ? d.q8_sh : nullptr;
+        swiglu_clamp_gu_t(g_buf, h_buf, T, SF, hp_.clamp_shexp[(size_t) il], d.stream, hq);
+        if (hq) gemv_q8(d, T, L.sh_down, hq, d.ffn_d, SF, E);
+        else gemv(d, T, L.sh_down, h_buf, d.ffn_d, SF, E);
+    };
+    if (early) {
+        swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 6, rows_max, FF, limit, d.stream);
+        strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream, nullptr, d.cnt + 6, kPackFuse ? d.dec_packed_h : nullptr);
+        if (!kPackFuse) strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream, nullptr, d.cnt + 6);
+        strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
+        shared_experts(d.sh_g, d.sh_h);
+    }
     if (doorbell) moe_wait(d.db_flag_d + il, d.tok_dev, d.stream);
     prof_mark(d, "moe_wait");
     if (cpu) moe_cpu_mask(d.cnt, d.grp_miss, d.miss_cpu_d + (size_t) il * 64, d.grp_ncols, d.stream);
@@ -1381,31 +1519,35 @@ void Engine::moe(Dev& d, int il, int T, const float* xn, float* out, bool doorbe
     // the misses: groups [cnt[0], cnt[1]) (in cpu mode the CPU-served groups have ncols 0: their pair rows came from the host)
     gate_up(d.cnt, d.cnt + 1);
     prof_mark(d, "moe_misses");
-    swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream);
-    if (decq2k) {
-        strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream);
-        strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream);
-        strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
+    if (early) {
+        swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream, d.cnt + 6);
+        strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream, d.cnt + 6, nullptr, kPackFuse ? d.dec_packed_h : nullptr);
+        if (!kPackFuse) strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream, d.cnt + 6, nullptr);
+        strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, d.cnt, d.cnt + 1, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
     } else {
-        strata::kernels::native_quantize_q8_1(d.ffn_h, d.q8_h, FF * rows_max, 1, d.stream);   // this window's pair rows in one launch
-        strata::kernels::native_mmvq_grouped((int) L.exp_down.type, d.grp_wd, d.q8_h, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.ffn_y, FF, E, max_pairs_, d.stream);
+        swiglu_clamp_rows(d.ffn_g, d.ffn_u, d.ffn_h, d.cnt + 2, rows_max, FF, limit, d.stream);
+        if (decq2k) {
+            strata::glm5::q2k::quantize_act(d.ffn_h, nullptr, rows_max, FF, d.dec_codes_h, d.dec_scales_h, d.dec_sums_h, d.stream, nullptr, nullptr, kPackFuse ? d.dec_packed_h : nullptr);
+            if (!kPackFuse) strata::glm5::q2k::pack_sums(d.dec_sums_h, rows_max, FF, d.dec_packed_h, d.stream);
+            strata::glm5::q2k::dec_wmma(d.grp_wd, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.dec_codes_h, d.dec_scales_h, d.dec_packed_h, d.ffn_y, FF, E, d.stream);
+        } else {
+            strata::kernels::native_quantize_q8_1(d.ffn_h, d.q8_h, FF * rows_max, 1, d.stream);   // this window's pair rows in one launch
+            strata::kernels::native_mmvq_grouped((int) L.exp_down.type, d.grp_wd, d.q8_h, d.grp_col0, d.grp_ncols, d.grp_orow, g0, d.cnt + 1, d.ffn_y, FF, E, max_pairs_, d.stream);
+        }
     }
     if (cpu) moe_wait(d.db_flag2_d + il, d.tok_dev, d.stream);   // the CPU's rows for its pairs are in ffn_y
     // the pairs of a token summed in the router's top-k order: the same bits whichever experts happen to be resident
     // (the pair list puts the hits first, so its order moves with the residency)
+    if (early) {   // the shared experts' rows added in the combine, the result straight into out
+        combine_tok(d.ffn_y, d.pair_w, d.tok_pairs, K, out, T, E, d.stream, d.ffn_d);
+        prof_mark(d, "moe_down");
+        prof_mark(d, "shared_experts");
+        return;
+    }
     combine_tok(d.ffn_y, d.pair_w, d.tok_pairs, K, d.ffn_acc, T, E, d.stream);
     prof_mark(d, "moe_down");
     if (dump) dump("ffn_moe_out", d.ffn_acc, {E}, false, dv);
-    const int SF = FF * std::max(1, hp_.n_expert_shared);
-    if (L.sh_gu.present()) {   // gate|up as one product (one launch, twice the rows per launch)
-        gemv(d, T, L.sh_gu, xn, d.ffn_g, E, 2 * SF);
-        swiglu_clamp_gu_t(d.ffn_g, d.ffn_h, T, SF, hp_.clamp_shexp[(size_t) il], d.stream);
-    } else {
-    gemv(d, T, L.sh_gate, xn, d.ffn_g, E, SF);
-    gemv(d, T, L.sh_up, xn, d.ffn_u, E, SF);
-    swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * SF, hp_.clamp_shexp[(size_t) il], d.stream);
-    }
-    gemv(d, T, L.sh_down, d.ffn_h, d.ffn_d, SF, E);
+    shared_experts(d.ffn_g, d.ffn_h);
     if (dump) dump("ffn_shexp", d.ffn_d, {E}, false, dv);
     add_rows(d.ffn_acc, d.ffn_d, T * E, d.stream);
     check(cudaMemcpyAsync(out, d.ffn_acc, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s), "ffn out");
@@ -1429,6 +1571,12 @@ void Engine::set_experts(ExpertStore* store) {
         d.ring_user.assign((size_t) nbuf, -1);
         d.ring_user_tok.assign((size_t) nbuf, 0);
         for (int i = 0; i < NL * 2; ++i) { cudaEvent_t e; check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "layer event"); d.layer_ev[(size_t) i] = e; }
+    }
+    static const bool kLendScratch = !std::getenv("STRATA_GLM5_LOAN_SCRATCH") || std::atoi(std::getenv("STRATA_GLM5_LOAN_SCRATCH")) != 0;   // 0: the ring's slots only
+    if (store->loans_on() && kLendScratch) {
+        for (auto& d : devs_)
+            for (const Dev::Lend& r : d.lend) store->add_loan_region(d.ordinal, r.base, r.bytes, r.skip);
+        store->finalize_loans();
     }
 }
 
@@ -1597,14 +1745,8 @@ void Engine::moe_mmq(Dev& d, int il, int T, const float* xn, float* out, bool do
     prof_mark(d, "moe_down");
     if (dump) dump("ffn_moe_out", d.ffn_acc, {E}, false, d.ordinal);
     const int SF = FF * std::max(1, hp_.n_expert_shared);
-    if (L.sh_gu.present()) {   // gate|up as one product (one launch, twice the rows per launch)
-        gemv(d, T, L.sh_gu, xn, d.ffn_g, E, 2 * SF);
-        swiglu_clamp_gu_t(d.ffn_g, d.ffn_h, T, SF, hp_.clamp_shexp[(size_t) il], d.stream);
-    } else {
-    gemv(d, T, L.sh_gate, xn, d.ffn_g, E, SF);
-    gemv(d, T, L.sh_up, xn, d.ffn_u, E, SF);
-    swiglu_clamp(d.ffn_g, d.ffn_u, d.ffn_h, T * SF, hp_.clamp_shexp[(size_t) il], d.stream);
-    }
+    gemv(d, T, L.sh_gu, xn, d.ffn_g, E, 2 * SF);   // gate | up as one product (one launch, twice the rows per launch)
+    swiglu_clamp_gu_t(d.ffn_g, d.ffn_h, T, SF, hp_.clamp_shexp[(size_t) il], d.stream);
     gemv(d, T, L.sh_down, d.ffn_h, d.ffn_d, SF, E);
     add_rows(d.ffn_acc, d.ffn_d, T * E, d.stream);
     check(cudaMemcpyAsync(out, d.ffn_acc, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s), "ffn out");
@@ -1763,9 +1905,7 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         prof_mark(d, "start");
         dequant_q8_0_rows(m_.token_embd().u8(), d.tok_rows, T, d.x, E, false, d.stream);
         if (dump) dump("inp_embd", d.x, {E}, false, d.ordinal);
-        for (int t = 0; t < T; ++t)
-            for (int h = 0; h < hp_.hc; ++h)
-                check(cudaMemcpyAsync(d.R + ((size_t) t * hp_.hc + h) * E, d.x + (size_t) t * E, (size_t) E * 4, cudaMemcpyDeviceToDevice, S(d.stream)), "hc_init");
+        init_streams(d.x, d.R, T, E, hp_.hc, d.stream);
         if (dump) dump("hc_init", d.R, {hp_.hc, E}, false, d.ordinal);
     } else {
         Dev& pd = devs_[(size_t) dev_of_layer_[(size_t) il0 - 1]];
@@ -1789,9 +1929,8 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         const bool last = c + 1 == n_chunks;
         float* Rc = d.R + (size_t) c0 * hp_.hc * E;
         float* xc = d.x + (size_t) c0 * E;
-        mhc(d, Tc, Rc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, xc);
+        mhc_norm(d, Tc, Rc, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, L.attn_norm, xc, d.xn);
         if (dl) dl("hc_attn_pre", xc, {E}, false, dv);
-        rms_norm(xc, L.attn_norm.f32(), d.xn, Tc, E, hp_.rms_eps, d.stream);
         if (dl) dl("attn_norm", d.xn, {E}, false, dv);
         prof_mark(d, "mhc");
         if (kDebugSync) { debug_sync(d.stream, il, "pre-attention"); debug_nan(d.xn, Tc, E, il, "attn_norm"); }
@@ -1801,9 +1940,8 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         prof_mark(d, hp_.is_recr[(size_t) il] ? "kda" : "dsa");
         mhc_post_t(d.y, Rc, d.post, d.comb, Rc, Tc, E, hp_.hc, d.stream);
         if (dl) dl("hc_attn_post", Rc, {hp_.hc, E}, false, dv);
-        mhc(d, Tc, Rc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, xc);
+        mhc_norm(d, Tc, Rc, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, L.ffn_norm, xc, d.xn);
         if (dl) dl("hc_ffn_pre", xc, {E}, false, dv);
-        rms_norm(xc, L.ffn_norm.f32(), d.xn, Tc, E, hp_.rms_eps, d.stream);
         if (dl) dl("ffn_norm", d.xn, {E}, false, dv);
         prof_mark(d, "mhc");
         if (il < hp_.n_dense_lead) {
@@ -1831,7 +1969,7 @@ void Engine::stage_run(Dev& d, Job& j, int il0, int il1, const DumpFn& dump) {
         return;
     }
     prof_mark(d, "embed/mhc_post");
-    for (int t = 0; t < T; ++t) mean_streams(d.R + (size_t) t * hp_.hc * E, d.x + (size_t) t * E, E, hp_.hc, d.stream);
+    mean_streams(d.R, d.x, T, E, hp_.hc, d.stream);
     if (dump) dump("hc_head", d.x, {E}, false, d.ordinal);
     rms_norm(d.x, m_.output_norm().f32(), d.h_win, T, E, hp_.rms_eps, d.stream);
     if (dump) dump("result_norm", d.h_win, {E}, false, d.ordinal);
@@ -1960,7 +2098,7 @@ void Engine::prompt_windows(int slot, const int32_t* tokens, int n, int wsize, c
 void Engine::commit(int n_keep) {
     if (n_keep < 1 || n_keep > win_T_) throw std::runtime_error("glm5: commit(" + std::to_string(n_keep) + ") outside the window of " + std::to_string(win_T_));
     if (n_keep < win_T_ && win_T_ > snap_T_) throw std::runtime_error("glm5: commit: a window of " + std::to_string(win_T_) + " tokens has no rollback snapshots");
-    if (n_keep < win_T_) {
+    if (n_keep < win_T_ && !kRollbackTable) {
         const int D = hp_.d_inner(), Sd = hp_.kda_head_dim;
         for (int il = 0; il < hp_.n_layer; ++il) {
             if (!hp_.is_recr[(size_t) il]) continue;
@@ -1971,6 +2109,34 @@ void Engine::commit(int n_keep) {
             const size_t cw = (size_t) (hp_.d_conv - 1) * D, snap_stride = (size_t) win_T_ * cw;
             for (int which = 0; which < 3; ++which)
                 check(cudaMemcpyAsync(conv_state_[st(il)] + which * cw, conv_snap_[(size_t) il] + which * snap_stride + (size_t) (n_keep - 1) * cw, cw * 4, cudaMemcpyDeviceToDevice, S(d.stream)), "conv rollback");
+        }
+    } else if (n_keep < win_T_) {
+        // the KDA states back to the snapshots after token n_keep - 1: one table-driven copy launch per device (the
+        // table in mapped pinned memory, two sets by commit parity: the previous commit's launch has long run)
+        const int D = hp_.d_inner(), Sd = hp_.kda_head_dim;
+        const size_t ssm_n = (size_t) hp_.n_head * Sd * Sd;
+        const size_t cw = (size_t) (hp_.d_conv - 1) * D, snap_stride = (size_t) win_T_ * cw;
+        for (auto& d : devs_) {
+            d.copy_n = 0;
+            if (!d.copy_tab_h) {
+                void* dv = nullptr;
+                d.copy_tab_h = static_cast<CopyEnt*>(alloc_mapped((uint64_t) 2 * d.copy_cap * sizeof(CopyEnt), d.ordinal, &dv));
+                d.copy_tab_d = static_cast<CopyEnt*>(dv);
+            }
+        }
+        for (int il = 0; il < hp_.n_layer; ++il) {
+            if (!hp_.is_recr[(size_t) il]) continue;
+            Dev& d = devs_[(size_t) dev_of_layer_[(size_t) il]];
+            CopyEnt* tab = d.copy_tab_h + (size_t) d.copy_par * d.copy_cap;
+            tab[d.copy_n++] = {ssm_state_[st(il)], ssm_snap_[(size_t) il] + (size_t) (n_keep - 1) * ssm_n, (int) ssm_n, 0};
+            for (int which = 0; which < 3; ++which)
+                tab[d.copy_n++] = {conv_state_[st(il)] + which * cw, conv_snap_[(size_t) il] + which * snap_stride + (size_t) (n_keep - 1) * cw, (int) cw, 0};
+        }
+        for (auto& d : devs_) {
+            if (!d.copy_n) continue;
+            check(cudaSetDevice(d.ordinal), "cudaSetDevice");
+            copy_table(d.copy_tab_d + (size_t) d.copy_par * d.copy_cap, d.copy_n, d.stream);
+            d.copy_par ^= 1;
         }
     }
     pos_ = win_start_ + n_keep;
@@ -2014,10 +2180,12 @@ const float* Engine::mtp_step_impl(const float* h_prev, int32_t tok, int pos, bo
     gemv(d, 1, L.eh_proj, d.mtp_cat, d.mtp_x, 2 * E, E);
     // the decoder layer with a plain residual
     rms_norm(d.mtp_x, L.attn_norm.f32(), d.xn, 1, E, hp_.rms_eps, d.stream);
+    d.xn_q8 = nullptr;
     dsa_layer(d, il, 1, pos, d.xn, d.y, DumpFn());
     check(cudaMemcpyAsync(d.mtp_x1, d.mtp_x, (size_t) E * 4, cudaMemcpyDeviceToDevice, s), "mtp x1");
     add_rows(d.mtp_x1, d.y, E, d.stream);
     rms_norm(d.mtp_x1, L.ffn_norm.f32(), d.xn, 1, E, hp_.rms_eps, d.stream);
+    d.xn_q8 = nullptr;
     const int saved_T = win_T_;
     win_T_ = 1;
     moe(d, il, 1, d.xn, d.y, false, DumpFn());   // every MTP expert is resident: no doorbell
@@ -2063,11 +2231,13 @@ const float* Engine::mtp_window_impl(const float* h_rows, const int32_t* toks, i
     gemv(d, T, L.eh_proj, d.mtp_cat, d.mtp_x, 2 * E, E);
     if (kDebugSync) { debug_sync(d.stream, il, "mtp eh_proj"); debug_nan(d.mtp_x, T, E, il, "mtp eh_proj out"); }
     rms_norm(d.mtp_x, L.attn_norm.f32(), d.xn, T, E, hp_.rms_eps, d.stream);
+    d.xn_q8 = nullptr;
     dsa_layer(d, il, T, pos0, d.xn, d.y, DumpFn());
     if (kDebugSync) { debug_sync(d.stream, il, "mtp dsa"); debug_nan(d.y, T, E, il, "mtp dsa out"); }
     check(cudaMemcpyAsync(d.mtp_x1, d.mtp_x, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s), "mtp x1");
     add_rows(d.mtp_x1, d.y, T * E, d.stream);
     rms_norm(d.mtp_x1, L.ffn_norm.f32(), d.xn, T, E, hp_.rms_eps, d.stream);
+    d.xn_q8 = nullptr;
     if (kDebugSync) { debug_sync(d.stream, il, "mtp ffn_norm"); debug_nan(d.xn, T, E, il, "mtp moe in"); }
     const int saved_T = win_T_;
     win_T_ = T;

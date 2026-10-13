@@ -84,6 +84,9 @@ void moe_publish(const int32_t* ids, int k, const uint32_t* tok, int32_t* h_ids,
 void write_flag(uint32_t* flag_dev, uint32_t v, void* stream);
 /// n floats (n % 4 == 0) from mapped pinned host memory (its device pointer) into device memory, by a kernel
 void copy_host_rows(const float* src_mapped, float* dst, size_t n, void* stream);
+void copy_dev(void* dst, const void* src, size_t bytes, void* stream);   ///< a device-to-device copy by a kernel (bytes % 16 == 0, 16-byte aligned)
+/// row runs desc[i] = (source row, destination row, rows) of n_embd floats each (desc in mapped pinned memory)
+void copy_host_rows_multi(const float* src_mapped, float* dst, const int32_t* desc_mapped, int n_desc, int n_embd, void* stream);
 /// The T tokens' MoE inputs ([T][n] floats) to mapped host memory (before moe_publish on the same stream).
 void publish_x(const float* x, int T, int n, float* h_x, void* stream);
 /// The dispatch tables, hits first (see kernels.cu): tabA/rowsA the hits' gate+up, tabB/rowsB the misses', tabC the downs,
@@ -105,7 +108,8 @@ void axpy_dev(float* y, const float* x, const float* a, int idx, int n, void* st
 void add_inplace(float* y, const float* x, int n, void* stream);
 void scale_inplace(float* x, int n, float s, void* stream);
 /// h[i] = mean_s R[s][i]
-void mean_streams(const float* R, float* h, int n_embd, int hc, void* stream);
+void mean_streams(const float* R, float* h, int T, int n_embd, int hc, void* stream);   ///< h[t] = the mean of R[t]'s hc streams
+void init_streams(const float* x, float* R, int T, int n_embd, int hc, void* stream);   ///< R[t][s] = x[t] for every stream s
 /// out[0] = argmax(x[0..n)), ties to the lower index
 void argmax(const float* x, int n, int32_t* out, int* scratch_idx, float* scratch_val, void* stream);
 /// Q8_0 row r of a [n, rows] GGUF tensor to f32 (the token embedding)
@@ -118,13 +122,31 @@ void layer_norm_t(const float* x, const float* w, const float* b, float* y, int 
 void mhc_mix_t(const float* R, const float* fn, const float* scale, const float* base, float* mixes, float* part, float* rs,
                float* pre, float* post, float* comb, int T, int n_embd, int hc, int iters, float eps_rms, float eps_hc, void* stream);
 void mhc_pre_apply_t(const float* R, const float* pre, float* x, int T, int n_embd, int hc, void* stream);
+/// the decode chain (T <= 8) in two launches: the mix sums, then rs + nonlinearity + pre-mix (x) + its RMS norm (xn, norm_w)
+/// xn_q8 (nullable): xn's q8_1 rows as native_quantize_q8_1 writes them ([T][n_embd / 32] blocks)
+void mhc_dec_t(const float* R, const float* fn, const float* scale, const float* base, float* mixes, float* part, float* pre, float* post,
+               float* comb, const float* norm_w, float* x, float* xn, uint8_t* xn_q8, int T, int n_embd, int hc, int iters, float eps_rms, float eps_hc, void* stream);
 void mhc_post_t(const float* y, const float* R_in, const float* post, const float* comb, float* R_out, int T, int n_embd, int hc,
                 void* stream);
-/// snap (may be null): the conv window after each token, [T][(d_conv-1)][d_inner], for the rollback
-void kda_conv_silu_t(const float* x, float* conv_state, const float* w, float* out, float* snap, int d_inner, int d_conv, int T,
-                     void* stream);
+/// up to three output rows of one launch (the q | k | v segments of a fused product)
+struct Ptr3 { float* p[3]; };
+/// one device-to-device copy of a table (n floats, both ends 16-byte aligned, n % 4 == 0)
+struct CopyEnt { float* dst; const float* src; int n; int pad; };
+void copy_table(const CopyEnt* tab_mapped, int n, void* stream);   ///< the table in mapped pinned memory
+/// y[t][r] = w[r] . x[t] for a narrow BF16 weight [n_out][n_in] (n_in % 8 == 0, <= 256), x rows at stride ldx, T <= 8 columns
+void bf16_gemv_narrow_t(const float* x, int ldx, const uint16_t* w, float* y, int n_in, int n_out, int T, void* stream);
+/// The conv of n_seg segments of d_inner channels (x: column c, row stride ldx; segment c / d_inner has its state at
+/// conv_state + seg * seg_stride, its taps at w[c * d_conv], its output in out.p[seg]).
+/// snap (may be null): the conv window after each token, [T][(d_conv-1)][d_inner] per segment at snap + seg * snap_stride, for the rollback
+void kda_conv_silu_t(const float* x, int ldx, int n_seg, float* conv_state, int seg_stride, const float* w, Ptr3 out, float* snap, int snap_stride,
+                     int d_inner, int d_conv, int T, void* stream);
 void kda_gate_t(const float* g_in, const float* dt_b, const float* A, float lower, float* g, int T, int n_head, int S, void* stream);
 /// snap (may be null): the state after each token, [T][H][S][S]
+/// The scan with its neighbours (T <= 8): q / k L2-normalized, g = gate(g_in + dt_b, A), beta's sigmoid (beta[t * ld_beta + h]),
+/// the recurrence (o, snap as kda_step_t; o may be null), the output's RMS norm (w_norm, eps_rms) and gate g2 -> normed, y
+void kda_step_fused(float* state, const float* q, const float* k, const float* v, const float* g_in, const float* dt_b, const float* A, float lower,
+                    const float* beta, int ld_beta, const float* w_norm, const float* g2, float* o, float* normed, float* y, uint8_t* y_q8,
+                    float* snap, int T, int n_head, int S, float eps_l2, float eps_rms, void* stream);   ///< y_q8 (nullable): y's q8_1 rows
 void kda_step_t(float* state, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o,
                 float* snap, int T, int n_head, int S, void* stream);
 void dsa_absorb_t(const uint16_t* wk_b, const float* q, float* q_abs, int T, int n_head, int kv_lora, int head_k, void* stream);
@@ -141,7 +163,8 @@ void moe_group(const int32_t* ids, const float* wts, int T, int K, int n_expert,
                float* pair_w, int* cnt, int* grp_e, int* grp_miss, bool split_hits, int* bounds, int* tok_pairs, int n_slots, int* bounds_res,
                int* bounds_miss, void* stream, int det_n = 64, int* rank_scratch = nullptr);   ///< det_n: a group's pairs in token order when T*K <= det_n (else arrival order); rank_scratch [T*K] for T*K > 64   ///< !split_hits: residents in slot order (bounds_res[n_slots+1]), then the non-resident by rank (bounds_miss)
 /// out[t] = sum over the token's K pairs (tok_pairs[t*K+k] = pair row) of pair_w * y[row]
-void combine_tok(const float* y, const float* pair_w, const int* tok_pairs, int K, float* out, int T, int n, void* stream);
+void combine_tok(const float* y, const float* pair_w, const int* tok_pairs, int K, float* out, int T, int n, void* stream,
+                 const float* add = nullptr);   ///< add (nullable): [T][n] rows added to the sums
 /// The prompt windows' dense DSA attention: the latent cache rows (and their transpose) as Q8_0 blocks, the selection
 /// masks from the per-token cell lists, and the masked softmax of a [rows][n_pad] score block in place.
 void set_pair(int32_t* p, int a, int b, void* stream);   ///< p[0] = a, p[1] = b on the stream (a bounds table without a host-side copy)
@@ -173,11 +196,11 @@ void lod_attn_fused(uint8_t* const* kvc_tab, uint8_t* const* means_tab, float bi
 void sel_mask(const int32_t* sel, const int* params, int TB, int n_sel_max, uint32_t* mask, int words, void* stream);
 void masked_softmax(float* S, int ld, const uint32_t* mask, int words, int rows, int H, int n_pad, float scale, const float* bias, void* stream);   ///< bias: per column (nullable)
 /// Batch decode windows (row t: slot row_slot[t] at position row_pos[t]; tab[slot] = that slot's state base for the layer).
-void kda_conv_rows(const float* x, float* const* tab, const int* row_slot, int which, const float* w, float* out, int d_inner, int d_conv, int T, void* stream);
 /// Runs of consecutive rows per slot (groups g: rows [grp_start[g], +grp_len[g]) of slot grp_slot[g]; row_k[t] = the row's index in its run):
 /// the conv and the recurrence in order within a run, with per-row snapshots for the rollback of rejected drafts.
-void kda_conv_grp(const float* x, float* const* tab, const int* row_slot, const int* row_k, int which, const float* w, float* out, float* snap,
-                  int d_inner, int d_conv, int T, const int* grp_slot, const int* grp_start, const int* grp_len, int n_grp, void* stream);
+/// segments as kda_conv_silu_t (a slot's state holds its segments at stride (d_conv - 1) * d_inner)
+void kda_conv_grp(const float* x, int ldx, int n_seg, float* const* tab, const int* row_slot, const int* row_k, const float* w, Ptr3 out, float* snap,
+                  int snap_stride, int d_inner, int d_conv, int T, const int* grp_slot, const int* grp_start, const int* grp_len, int n_grp, void* stream);
 void kda_step_grp(float* const* tab, const int* grp_slot, const int* grp_start, const int* grp_len, int n_grp, const float* q, const float* k,
                   const float* v, const float* g, const float* beta, float* o, float* snap, int n_head, int S, void* stream);
 void kda_step_rows(float* const* tab, const int* row_slot, const float* q, const float* k, const float* v, const float* g, const float* beta,
@@ -200,7 +223,7 @@ void moe_gather_experts(const void* const* grp_w, const int* grp_e, const int* g
 void moe_cpu_mask(const int* cnt, const int* grp_miss, const int* miss_cpu, int* grp_ncols, void* stream);
 /// h[r] = swiglu_clamp(gu[r][0..n), gu[r][n..2n)) for the first *n_rows rows
 void swiglu_clamp_gu(const float* gu, float* h, const int* n_rows, int max_rows, int n, float limit, void* stream);
-void swiglu_clamp_gu_t(const float* gu, float* h, int T, int n, float limit, void* stream);   ///< h[t][i] = swiglu(gu[t][i], gu[t][n + i]) for T rows
+void swiglu_clamp_gu_t(const float* gu, float* h, int T, int n, float limit, void* stream, uint8_t* h_q8 = nullptr);   ///< h_q8 (nullable): h's q8_1 rows
 /// After the misses were served: miss m lives in slot miss_slot[m] (< 0: staging slot m); repoint the miss groups and
 /// update the device slot table (miss_out[m] is the evicted expert or -1).  Runs after moe_wait / join.
 void moe_place(const int* cnt, const int* grp_miss, const int* grp_e, const int* miss_slot, const int* miss_out, const uint8_t* slots,
@@ -208,7 +231,8 @@ void moe_place(const int* cnt, const int* grp_miss, const int* grp_e, const int*
                int32_t* slot_of, void* stream);
 void gather_q8(const uint8_t* xq, const int* pair_tok, const int* n_pairs, uint8_t* xg, int col_bytes, int max_pairs, void* stream);
 void combine_pairs(const float* y, const float* pair_w, const int* pair_tok, const int* n_pairs, float* out, int T, int n, void* stream);
-void swiglu_clamp_rows(const float* g, const float* u, float* h, const int* n_rows, int max_rows, int n, float limit, void* stream);
+void swiglu_clamp_rows(const float* g, const float* u, float* h, const int* n_rows, int max_rows, int n, float limit, void* stream,
+                       const int* row_lo = nullptr);   ///< rows [*row_lo (0 when null), *n_rows)
 void argmax_rows(const float* x, int rows, int n, int32_t* out, int* scratch_idx, float* scratch_val, void* stream);
 /// rows[t] of a Q8_0 [n, V] tensor to f32 [T][n]; zero_first: row 0 of the output is zero (the MTP's position-0 rule)
 void dequant_q8_0_rows(const uint8_t* w, const int32_t* rows, int T, float* out, int n, bool zero_first, void* stream);

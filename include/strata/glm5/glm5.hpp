@@ -12,6 +12,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cstdint>
+#include <initializer_list>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -79,15 +80,15 @@ struct LayerWeights {
     DevTensor attn_norm, ffn_norm;
     DevTensor hc_attn_fn, hc_attn_scale, hc_attn_base, hc_ffn_fn, hc_ffn_scale, hc_ffn_base;
     // KDA
-    DevTensor wq, wk, wv, wo, conv_q, conv_k, conv_v, f_a, f_b, g_a, g_b, beta, ssm_a, dt_b, ssm_norm;
+    DevTensor wqkv, wo, conv_qkv, fab, f_b, g_b, ssm_a, dt_b, ssm_norm;   ///< wqkv = q | k | v [3 D][E], conv_qkv their taps [3 D][d_conv], fab = f_a | g_a | beta [2 S + H][E]
     // DSA
     DevTensor q_a, q_a_norm, q_b, kv_a, kv_a_norm, k_b, v_b;
     DevTensor k_b_q8, v_b_q8;          ///< Q8_0 copies of k_b / v_b (the prompt windows' per-head MMQ); absent when the source type is not BF16 / Q8_0
     DevTensor idx_k, idx_k_norm, idx_k_norm_b, idx_proj, idx_q_b, idx_gate, idx_ape;
     // FFN
-    DevTensor ffn_gate, ffn_up, ffn_down;                     // the dense layers
-    DevTensor gate_inp, exp_probs_b, sh_gate, sh_up, sh_down; // the MoE layers
-    DevTensor sh_gu;                   ///< sh_gate and sh_up as one [2 SF][E] matrix (one product, one launch)
+    DevTensor ffn_gu, ffn_down;                               // the dense layers (gate | up stacked as one [2 FF][E] matrix)
+    DevTensor gate_inp, exp_probs_b, sh_down; // the MoE layers
+    DevTensor sh_gu;                   ///< the shared experts' gate | up as one [2 SF][E] matrix (one product, one launch)
     ExpertTensor exp_gate, exp_up, exp_down;
     // the MTP (NextN) layer only
     DevTensor eh_proj, enorm, hnorm, shared_head_norm;
@@ -126,7 +127,8 @@ public:
 private:
     void init(const std::string& any_shard, bool verbose);
     DevTensor upload(const strata::GgufModel& g, const std::string& name, int device, bool required = true);
-    DevTensor concat_rows(const DevTensor& a, const DevTensor& b);
+    DevTensor stack_rows(std::initializer_list<DevTensor*> parts);
+    void release(DevTensor& t);
     ExpertTensor expert(const strata::GgufModel& g, const std::string& name);
     std::unique_ptr<strata::GgufModel> gguf_, mtp_gguf_;
     HParams hp_;
@@ -143,6 +145,8 @@ private:
 
 /// A named intermediate for comparison with llama.cpp's dump: `shape` in numpy order (token axis absent), f32 device
 /// data or int32 when `is_int`.  The data lives on the device `device`.
+struct CopyEnt;   // (kernels.hpp) one entry of the rollback copies' table
+
 using DumpFn = std::function<void(const std::string& name, const void* dev, const std::vector<int64_t>& shape,
                                   bool is_int, int device)>;
 
@@ -261,6 +265,15 @@ public:
         float *R = nullptr, *x = nullptr, *xn = nullptr, *y = nullptr, *mixes = nullptr, *part = nullptr, *rs = nullptr,
               *pre = nullptr, *post = nullptr, *comb = nullptr;
         float *big_a = nullptr, *big_b = nullptr, *big_c = nullptr, *big_d = nullptr;   // [T][big]
+        float *qkv = nullptr, *fab = nullptr;   // the fused KDA products: [min(T, kQkvFuseT)][3 D], [kFabT][2 S + H]
+        float *sh_g = nullptr, *sh_h = nullptr;   // the shared experts' gate | up and h for a decode window (computed before the miss wait)
+        float* dense_gu = nullptr;                 // a dense layer's gate | up product for a decode window
+        uint8_t* q8_sh = nullptr;                  // the shared experts' h as q8_1 rows (written by their swiglu)
+        const uint8_t* xn_q8 = nullptr;            // xn's q8_1 rows when the kernel that wrote xn quantized it too (else null)
+        CopyEnt* copy_tab_h = nullptr; CopyEnt* copy_tab_d = nullptr;   // the rollback copies' table (mapped pinned, two sets)
+        int copy_cap = 0, copy_n = 0, copy_par = 0;
+        struct Lend { uint8_t* base; uint64_t bytes, skip; };
+        std::vector<Lend> lend;                    // buffers the decode windows leave idle past `skip` bytes: lent to the expert cache
         float *small_a = nullptr, *small_b = nullptr;                                     // [T][q_lora]
         float *ffn_g = nullptr, *ffn_u = nullptr, *ffn_h = nullptr, *ffn_y = nullptr, *ffn_acc = nullptr, *ffn_d = nullptr;
         float *logits = nullptr, *probs = nullptr, *wts = nullptr, *h_win = nullptr;
@@ -372,7 +385,10 @@ public:
 
 private:
     void mhc(Dev& d, int T, const float* R, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, float* x);
-    void gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, int n_in, int n_out);
+    void mhc_norm(Dev& d, int T, const float* R, const DevTensor& fn, const DevTensor& scale, const DevTensor& base, const DevTensor& norm,
+                  float* x, float* xn);
+    void gemv(Dev& d, int T, const DevTensor& w, const float* x, float* y, int n_in, int n_out, int ldx = 0);   ///< ldx (0 = n_in): x's row stride (the small BF16 kernels only)
+    void gemv_q8(Dev& d, int T, const DevTensor& w, const uint8_t* xq, float* y, int n_in, int n_out);   ///< a quantized weight on q8_1 rows already made (T <= 8)
     void kda_layer(Dev& d, int il, int T, const float* xn, float* out, const DumpFn& dump);
     void dsa_layer(Dev& d, int il, int T, int pos0, const float* xn, float* out, const DumpFn& dump);
 public:

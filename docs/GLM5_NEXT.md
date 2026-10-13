@@ -1024,3 +1024,52 @@ the next lever for 256-2048-token prompts.
   many pairs: the CPU's share shrinks while the prefetch-ahead overlap is lost). Outputs differ from the prefetch-all
   path only by the CPU's rounding (the 1064 + 24 test with the split: 24/24 the original reference). 40-token prompt
   0.97 s (1.81 at the start of these passes), slots-test 0 mismatches.
+
+## Small gains, pass 3: the decode round (2026-10-13)
+
+A kernel census of a decode round (rocprofv3, 3 rows, spec 2) before this pass: ~3,430 launches per round on the two
+cards, ~46 ms of kernels, ~50 ms spinning in the doorbell wait for the CPU-served experts, and ~13 ms of inter-kernel
+gaps (3-4 us each: RDNA 3's in-order queue between dependent launches). The pass takes the launches down and moves work
+under the wait; every change is switchable by an environment variable (listed) and the slots-test (solo against batch
+rows, CPU service off) stays at 0 mismatches.
+
+- **KDA layer** (`STRATA_GLM5_KDA_FUSE=0` restores): q | k | v as one stacked Q8_0 product and one conv launch
+  (`wqkv`, `conv_qkv`; a prompt window takes the three row slices one at a time), f_a | g_a | beta as one BF16 product
+  (`fab`, its columns read at stride), and the scan with its neighbours in one kernel (`k_kda_step_f`: the L2 norms,
+  the gate, beta's sigmoid, the recurrence, the output RMS norm and gate; the gate's exp once per element instead of
+  once per state row). Bit-identical to the chain it replaces. 26 launches per layer -> 10.
+- **mHC decode tail** (`STRATA_GLM5_MHC_DEC=0`): rs + nonlinearity + pre-mix + the following RMS norm as one block per
+  token (`k_mhc_finish_t`, 1024 threads); the mixes kernel runs unscaled and the scale is applied to the sums (the one
+  rounding change of the pass). 6 launches per layer half -> 2.
+- **MoE order** (`STRATA_GLM5_MOE_EARLY=0`): the resident experts' swiglu / down product and the shared experts go
+  before the wait on the served misses (the GPU idles there otherwise); the combine adds the shared rows and writes the
+  layer output directly (the `add_rows` + memcpy gone). Bit-identical.
+- **q8 rows from the producers** (`STRATA_GLM5_Q8_FUSE=0`): the kernels that write `xn`, the KDA output `y` and the
+  shared experts' `h` also write their q8_1 rows (the same bits as `native_quantize_q8_1`, a warp per block of 32), so
+  the Q8_0 projections from them skip the separate quantize launch (`gemv_q8`). The dense layers' gate | up stacked too.
+- **Smaller ones**: the CPU-served rows copied by one descriptor-driven launch per layer (was one per expert); the
+  Q2_K activation quantizer packs its own sums (`pack_sums` gone from the decode path); the routing kernel's serial
+  pass walks the routed experts (sorted in shared memory) instead of all 288 (38 -> 16 us); the residual streams
+  initialised and averaged by one launch per window; the draft rollback's 136 state memcpys as one table-driven launch
+  per card; a narrow-K BF16 GEMV (thread per output row, the columns in shared memory) for f_b / g_b
+  (`STRATA_GLM5_NARROW_BF16=0`); the MoE's q8 input only made for the non-Q2_K layers.
+- **The loan pool in the prompt scratch** (`STRATA_GLM5_LOAN_SCRATCH=0`): the buffers a decode window leaves idle
+  (the dense-attention and MMQ / GEMM scratch whole; the pair, projection and attention buffers past 16 rows' worth)
+  are carved into loan slots too: 622 ring slots + 892 scratch slots (7.4 GB more). Every prompt window (T >= 9)
+  already drops the loans before it touches the buffers.
+
+Per decode round (200 tokens after a 40-token prompt; the token count per round varies with the drafts accepted, so
+the round time is the measure): 79.0 ms before the pass -> 76.7 (KDA) -> 74.7 (mHC, MoE order) -> 73.6 (q8 rows,
+routing, copies) -> 69.4 ms (the loan pool in the scratch) -> 67.3 ms (the narrow BF16 GEMV, the packed quantizer, the
+rollback table, the wider mHC tail); launches per round 3,430 -> 2,295 before the loan change. Tried and left off:
+llama.cpp's two-rows-per-block multi-column MMVQ layout (`STRATA_GLM5_MMVQ_UPSTREAM=1`): 67.7 ms, no gain.
+Also in this pass: the loan copies by a shader kernel instead of the copy engine (`STRATA_GLM5_LOAN_MEMCPY=1` restores),
+the doorbell publish's host write in 16-byte stores. An open item: with the CPU service off (`STRATA_GLM5_CPU=0`, the
+slots-test's mode) the solo decode after the pass measures 83 ms/token against 75 before it with every switch off and
+every GPU phase equal except the doorbell wait; the same routing gets fewer hits there (79.8 against 82.5% from VRAM,
+more adaptive swaps and thrash) - the lookahead staging and the swap policy react to the changed timing. The CPU-served
+mode the server runs in is faster throughout.
+The slots-test's solo decode with the CPU service off: 84.0 -> 74.7 ms/token. Prompts unchanged (40 tokens 0.97 s,
+430 tokens 2.59 s, 1064 tokens 3.26 s, the 1064-token output identical). The remaining round: ~43 ms in the wait for
+the CPU-served experts (memory-bus bound), ~12 ms of Q8_0 dense products, ~10 ms of Q2_K expert products, ~11 ms of
+launch gaps.
