@@ -1,3 +1,4 @@
+#include <cstdlib>
 // src/glm5/moe_q2k.cu - see include/strata/glm5/moe_q2k.hpp
 #include "strata/glm5/moe_q2k.hpp"
 #include <cuda_runtime.h>
@@ -420,6 +421,17 @@ void experts(const uint8_t* w, uint64_t expert_bytes, uint64_t mat_off, int n_ro
              const int8_t* codes, const float* scales, const int32_t* packed, float* dst, int ld_dst, void* s, const int32_t* skip) {
     if (n <= 0 || max_cols <= 0) return;
     if (n_rows % kRowTile) throw std::runtime_error("q2k: n_rows must be a multiple of " + std::to_string(kRowTile));
+    static const int kNT = std::getenv("STRATA_GLM5_Q2K_NT") ? std::atoi(std::getenv("STRATA_GLM5_Q2K_NT")) : 2;   // column tiles of 16 per block: the weight dequantized once per 16 NT columns
+    if (kNT >= 4) {
+        const dim3 grid((unsigned) (n_rows / kRowTile), (unsigned) ((max_cols + 63) / 64), (unsigned) n);
+        k_experts<4><<<grid, kThreads, 0, S(s)>>>(w, expert_bytes, mat_off, n_rows, K, bounds, codes, scales, packed, dst, ld_dst, skip);
+        return;
+    }
+    if (kNT == 3) {
+        const dim3 grid((unsigned) (n_rows / kRowTile), (unsigned) ((max_cols + 47) / 48), (unsigned) n);
+        k_experts<3><<<grid, kThreads, 0, S(s)>>>(w, expert_bytes, mat_off, n_rows, K, bounds, codes, scales, packed, dst, ld_dst, skip);
+        return;
+    }
     const dim3 grid((unsigned) (n_rows / kRowTile), (unsigned) ((max_cols + 31) / 32), (unsigned) n);
     k_experts<2><<<grid, kThreads, 0, S(s)>>>(w, expert_bytes, mat_off, n_rows, K, bounds, codes, scales, packed, dst, ld_dst, skip);
 }

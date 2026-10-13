@@ -1043,3 +1043,18 @@ CPU 供給 expert の待ち約 43 ms (メモリバス律速)、Q8_0 dense 積約
   (CPU 供給 off、slots-test のモード) は貸出をまったく作らないので、そこでは swap が唯一の適応 (切ると ヒット 95 → 60%)。2 つの
   プロンプトでのラウンドあたり draft 本数の確認は `--spec 2` のまま (spec 1: 29.8 / 32.8、spec 2: 35.2 / 35.7、spec 3: 33.4 / 35.7 tok/s)。
 - ほかに: 対の数が同じミスの間では最も多く routing された expert を PCIe 側に (その blob が貸出になる)。
+
+## 小さな改善、第 5 回: 素の serve 経路の貸出 (2026-10-13)
+
+素の serve 経路 (CPU 供給 off: `STRATA_GLM5_CPU=0`、slots-test のモード、CPU 経路のないマシン) は貸出を作っていなかった: CPU 分担経路だけが
+作っていた。同じやり方で作るようにした (staging されたミスを貸出スロットにもコピー)。最初の試みが外した 1 点: ホスト側のヒット判定は
+生きている貸出をヒットと数えなければならない - device は自分のテーブル (貸出を含む) で staging スロットに番号を振るので、ミスと数えると
+staging の番号がすべてずれ、slots-test で 50 mismatches になった。直すとビット一致 (40 トークン decode のトークンが前のビルドと同じ) で、
+CPU off の decode は 61.8 → 44.5 ms/token (40 + 200)、slots-test の solo 82.8 → 64.3 ms/token、2 スロット・窓 1 トークンで 72.2 → 53.2
+ms/token。batch の行は少し損をする (窓あたり 53.5 → 72.6 ms、ヒット 94.8 → 90.4%): 貸出された expert は「もう一度ミス」しないので
+admission フィルタがそれを常駐へ swap せず、次の prompt 窓で貸出が落ちるため。
+
+そのための昇格 (admission 窓の中で貸出ヒットした expert を貸出コピーから常駐スロットへ swap) を試した: 無制限だと thrash (200 トークンで
+swap 2,800、ラウンド 94 ms); ヒット数で絞っても、ある経路で prompt 窓をまたいだ device のテーブルの不整合が残った (slots-test の 2 会話目で
+routing id が 2^31 - 1)。原因が見つかるまでコードに残したまま off (`STRATA_GLM5_PROMOTE_HITS`、既定 0)。この回ではほかに: prompt WMMA
+カーネルの列タイル幅の切り替え (`STRATA_GLM5_Q2K_NT`、2 / 3 / 4)、CLI 最終行に貸出・昇格・コピーの集計。

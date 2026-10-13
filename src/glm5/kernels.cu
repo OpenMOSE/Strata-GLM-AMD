@@ -2207,7 +2207,7 @@ void copy_host_rows(const float* src_mapped, float* dst, size_t n, void* s) {
 __global__ void k_loan_apply(const int32_t* __restrict__ entries, int n, int32_t* __restrict__ slot_of) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const int e = entries[2 * i], j = entries[2 * i + 1];
-        slot_of[e] = j < 0 ? -1 : (kLoanBit | j);
+        slot_of[e] = j < -1 ? -2 - j : j < 0 ? -1 : (kLoanBit | j);   // (-2 - slot): a resident slot (a promoted loan)
     }
 }
 void loan_apply(const int32_t* entries, int n, int32_t* slot_of, void* s) {

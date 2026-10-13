@@ -408,6 +408,54 @@ int ExpertStore::device_index_of_layer(int il) const {
     return 0;
 }
 
+bool ExpertStore::promote_loan(LayerExperts& E, int il, size_t di, int e, uint32_t tok, int max_swaps, int& swapped, void* cs_) {
+    cudaStream_t cs = static_cast<cudaStream_t>(cs_);
+    const uint32_t lm = E.last_miss_tok[(size_t) e];
+    const bool admit = admit_window_ == 0 || (lm != 0 && tok + 1 - lm <= admit_window_);
+    E.last_miss_tok[(size_t) e] = tok + 1;
+    if (!admit || swapped >= max_swaps || evict_[di].n_slots != 0 || !E.host_pinned[(size_t) e] || E.host_gate[(size_t) e] == nullptr) return false;
+    const int32_t victim = pick_victim(E, tok, tok);   // (a slot no row of this window reads)
+    if (victim < 0) return false;
+    int j;
+    {
+        std::lock_guard<std::mutex> lk(loan_m_);
+        j = E.loan_of[(size_t) e];
+        if (loan_apply_n_[(size_t) il] + 2 > kLoanApplyMax) j = -1;   // both table entries must land: no promotion when the list is full
+    }
+    if (j < 0) return false;
+    const int e_out = E.expert_of[(size_t) victim];
+    uint8_t* slot_mem = E.slots + (uint64_t) victim * E.stride;
+    uint8_t* hb = const_cast<uint8_t*>(E.host_gate[(size_t) e]);
+    // the exchange of homes: the victim's blob into e's pinned host blob (which it inherits), e's loan copy into the slot
+    check(cudaMemcpyAsync(hb, slot_mem, E.blob, cudaMemcpyDeviceToHost, cs), "promote d2h");
+    check(cudaMemcpyAsync(slot_mem, loan_ptr_h_[di][(size_t) j], E.blob, cudaMemcpyDeviceToDevice, cs), "promote d2d");
+    copy_bytes_ += 2 * E.blob;
+    E.host_gate[(size_t) e_out] = hb; E.host_up[(size_t) e_out] = hb + E.gate_bytes; E.host_down[(size_t) e_out] = hb + E.gate_bytes + E.up_bytes;
+    E.host_pinned[(size_t) e_out] = 1;
+    E.host_gate[(size_t) e] = E.host_up[(size_t) e] = E.host_down[(size_t) e] = nullptr;
+    E.host_pinned[(size_t) e] = 0;
+    E.slot_of[(size_t) e_out] = -1;
+    E.evicted_once[(size_t) e_out] = 1;
+    E.slot_of[(size_t) e] = victim;
+    E.expert_of[(size_t) victim] = e;
+    E.slot_last_used[(size_t) victim] = tok;
+    E.loan_hits_n[(size_t) e] = 0;
+    ++swapped; ++promotions_;
+    {
+        // the device's table at the layer's next grouping (after this window's flag, which the copies precede): e -> the
+        // slot, e_out -> missing; the loan slot stays out of the free list (this window may read it) until the LRU takes it
+        std::lock_guard<std::mutex> lk(loan_m_);
+        loan_push(il, e, -2 - victim);
+        loan_push(il, e_out, -1);
+        E.loan_of[(size_t) e] = -1;
+        E.loan_live[(size_t) e] = 0;
+        loan_holder_[di][(size_t) j] = {-1, -1};
+        loan_last_used_[di][(size_t) j] = tok;
+        loan_busy_[di][(size_t) j] = 0;
+    }
+    return true;
+}
+
 int32_t ExpertStore::pick_victim(LayerExperts& E, uint32_t tok, uint32_t protect) {
     // The slot whose expert was routed longest ago, never one routed in a window >= protect; among equally old slots
     // the one whose expert has a pinned host copy (no device-to-host save needed).  A policy that always evicted the
@@ -633,6 +681,7 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
     cudaStream_t cs = static_cast<cudaStream_t>(copy_streams_[di]);
     std::vector<std::function<void()>> jobs;
     std::vector<int> missed;   // distinct missed experts, first-occurrence order = the device's miss index
+    int swapped = 0, n_promoted = 0;
     for (int j = 0; j < n; ++j) {
         const int e = ids[j];
         if (e < 0 || e >= (int) E.slot_of.size())
@@ -640,18 +689,30 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
         ++counts_[(size_t) il][(size_t) e];
         const int32_t slot = E.slot_of[(size_t) e];
         if (slot >= 0) { ++hits_; E.slot_last_used[(size_t) slot] = tok; continue; }
+        if (loan_on_ && E.loan_live[(size_t) e]) {   // a loan the device's table holds: a hit for both sides (the device numbers the staging slots by its table)
+            ++hits_; ++loan_hits_;
+            if (!seen_[(size_t) e]) {
+                seen_[(size_t) e] = 2;
+                uint8_t& hn = E.loan_hits_n[(size_t) e];
+                if (hn < 255) ++hn;
+                const bool want = promote_hits_ > 0 && hn >= promote_hits_ && n_promoted < promote_max_;
+                if (want && promote_loan(E, il, di, e, tok, max_swaps, swapped, cs)) ++n_promoted;
+                else loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+            }
+            continue;
+        }
         ++misses_;
         if (seen_[(size_t) e]) continue;
         seen_[(size_t) e] = 1;
         missed.push_back(e);
     }
     for (int e : missed) seen_[(size_t) e] = 0;
+    for (int j = 0; j < n; ++j) seen_[(size_t) ids[j]] = 0;   // (the loan hits' marks too)
     std::sort(missed.begin(), missed.end());   // k_moe_group numbers the staging slots in ascending expert id
     if ((int) missed.size() > k_max_) throw std::runtime_error("serve: " + std::to_string(missed.size()) + " distinct misses, staging holds " + std::to_string(k_max_));
     distinct_misses_ += missed.size();
     if (!missed.empty()) ++layers_missed_;
     for (int e : missed) if (E.evicted_once[(size_t) e]) ++thrash_;
-    int swapped = 0;
     std::vector<int> staged;   // misses that stay in staging (read from the file first when unpinned)
     cudaEvent_t t_start = nullptr, t_end = nullptr;
     if (copy_timing_ && !missed.empty()) {
@@ -666,6 +727,38 @@ int ExpertStore::serve(int il, const int32_t* ids, int n, uint32_t tok, uint32_t
     for (size_t m = 0; m < missed.size(); ++m) dma_miss(E, il, di, m, missed[m], tok, miss_slot, miss_out, max_swaps, swapped, jobs, staged, cs);
     finish_staged(E, di, miss_slot, jobs, staged, cs);
     swaps_ += (uint64_t) swapped;
+    // the loans, as the CPU-split path makes them: a miss that stays in its staging slot is also copied into a loan
+    // slot (device to device, behind the staging copies), a hit from this layer's next window on
+    if (loan_on_ && E.stride <= loan_stride_ && !missed.empty()) {
+        cudaStream_t ls = static_cast<cudaStream_t>(loan_streams_[di]);
+        LoanBatch batch{nullptr, di, {}};
+        bool ordered = false;
+        for (size_t m = 0; m < missed.size() && (int) batch.adds.size() < loan_per_win_; ++m) {
+            if (miss_slot[m] >= 0) continue;   // swapped into a resident slot: resident already
+            const int e = missed[m];
+            int j;
+            { std::lock_guard<std::mutex> lk(loan_m_); j = loan_alloc(di, il, e, tok); }
+            if (j < 0) break;
+            if (!ordered) {
+                std::lock_guard<std::mutex> lk(loan_m_);
+                cudaEvent_t se = static_cast<cudaEvent_t>(loan_event(di));
+                check(cudaEventRecord(se, cs), "loan stage event"); check(cudaStreamWaitEvent(ls, se, 0), "loan stage wait");
+                loan_event_done(di, se); ordered = true;
+            }
+            uint8_t* dst = loan_ptr_h_[di][(size_t) j];
+            if (!kLoanMemcpy && E.blob % 16 == 0) copy_dev_kernel(E.device, dst, stage_[di] + m * stage_slot_bytes_[di], E.blob, ls);
+            else check(cudaMemcpyAsync(dst, stage_[di] + m * stage_slot_bytes_[di], E.blob, cudaMemcpyDeviceToDevice, ls), "loan d2d");
+            copy_bytes_ += E.blob;
+            batch.adds.emplace_back(e, j);
+        }
+        if (!batch.adds.empty()) {
+            std::lock_guard<std::mutex> lk(loan_m_);
+            batch.ev = loan_event(di);
+            check(cudaEventRecord(static_cast<cudaEvent_t>(batch.ev), ls), "loan batch event");
+            loans_made_ += batch.adds.size();
+            loan_batches_[(size_t) il].push_back(std::move(batch));
+        }
+    }
     if (t_start) {
         cudaEventRecord(t_end, cs);
         timing_events_.emplace_back(t_start, t_end);
@@ -753,7 +846,9 @@ void ExpertStore::init_loans(int n_layers) {
     // default: loans only from the PCIe-staged misses (their blob crosses the memory bus once, the loan is a device copy);
     // STRATA_GLM5_LOAN_H2D=1 also copies the CPU-served misses from the host (a second read of each: measured slower)
     loan_h2d_ = std::getenv("STRATA_GLM5_LOAN_H2D") && std::atoi(std::getenv("STRATA_GLM5_LOAN_H2D")) != 0;
-    for (auto& E : layers_) { E.loan_of.assign(E.slot_of.size(), -1); E.loan_live.assign(E.slot_of.size(), 0); }
+    for (auto& E : layers_) { E.loan_of.assign(E.slot_of.size(), -1); E.loan_live.assign(E.slot_of.size(), 0); E.loan_hits_n.assign(E.slot_of.size(), 0); }
+    if (std::getenv("STRATA_GLM5_PROMOTE_HITS")) promote_hits_ = std::max(0, std::atoi(std::getenv("STRATA_GLM5_PROMOTE_HITS")));
+    if (std::getenv("STRATA_GLM5_PROMOTE_MAX")) promote_max_ = std::max(0, std::atoi(std::getenv("STRATA_GLM5_PROMOTE_MAX")));
     if (!loan_on_) return;
     // the slot pitch: the most common layer stride (layers with a larger one do not loan)
     std::map<uint64_t, int> strides;
@@ -879,6 +974,7 @@ int ExpertStore::loan_alloc(size_t di, int il, int e, uint32_t tok) {
     loan_last_used_[di][(size_t) j] = tok;
     loan_busy_[di][(size_t) j] = 1;
     layers_[(size_t) il].loan_of[(size_t) e] = j;
+    layers_[(size_t) il].loan_hits_n[(size_t) e] = 0;
     return j;
 }
 
@@ -948,9 +1044,10 @@ void ExpertStore::reset_loans() {
     for (size_t il = 0; il < layers_.size(); ++il) {
         LayerExperts& E = layers_[il];
         if (E.device < 0 || E.loan_of.empty()) continue;
-        bool any = false;
+        bool any = loan_apply_n_[il] > 0;   // entries not yet applied (a promotion's, an eviction's): the table from the host mirror
         for (auto& v : E.loan_of) if (v >= 0) { v = -1; any = true; }
         for (auto& v : E.loan_live) v = 0;
+        for (auto& v : E.loan_hits_n) v = 0;
         loan_apply_n_[il] = 0;
         for (auto& b : loan_batches_[il]) loan_event_done(b.di, b.ev);
         loan_batches_[il].clear();
@@ -1156,6 +1253,8 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
     // inside a group the pairs in token order
     std::vector<int> count((size_t) ne, 0);
     auto resident = [&](int e) { return E.slot_of[(size_t) e] >= 0 || (loan_on_ && E.loan_live[(size_t) e]); };   // live = in the device's table too
+    std::vector<char> promoted((size_t) ne, 0);   // a loan hit's promotion tried once per window
+    int n_promoted = 0, n_promo_calls = 0;
     for (int j = 0; j < n; ++j) {
         const int e = ids[j];
         if (e < 0 || e >= ne) {   // a routing id outside the experts: the router saw NaN / garbage activations
@@ -1163,7 +1262,20 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
             throw std::runtime_error("glm5 experts: a routing id out of range (corrupt activations)");
         }
         ++counts_[(size_t) il][(size_t) e]; ++count[(size_t) e];
-        if (resident(e)) { ++hits_; if (E.slot_of[(size_t) e] < 0) { ++loan_hits_; loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok; } } else ++misses_;
+        if (resident(e)) {
+            ++hits_;
+            if (E.slot_of[(size_t) e] < 0) {
+                ++loan_hits_;
+                if (!promoted[(size_t) e]) {
+                    promoted[(size_t) e] = 1;
+                    uint8_t& hn = E.loan_hits_n[(size_t) e];
+                    if (hn < 255) ++hn;
+                    const bool want = promote_hits_ > 0 && hn >= promote_hits_ && n_promo_calls < promote_max_;
+                    if (want && promote_loan(E, il, di, e, tok, max_swaps, n_promoted, cs)) ++n_promo_calls;
+                    else loan_last_used_[di][(size_t) E.loan_of[(size_t) e]] = tok;
+                }
+            }
+        } else ++misses_;
     }
     int col = 0;
     for (int e = 0; e < ne; ++e) if (count[(size_t) e] && resident(e)) col += count[(size_t) e];
@@ -1215,7 +1327,7 @@ int ExpertStore::serve_cpu(int il, const int32_t* ids, int n, int T, const float
             on_cpu[(size_t) best] = 0; cpu_t = cpu_after; dma_t = dma_after;
         }
     }
-    int n_dma = 0, n_cpu_pairs = 0, swapped = 0;
+    int n_dma = 0, n_cpu_pairs = 0, swapped = n_promoted;   // (the promotions count against the window's swap budget)
     std::vector<std::function<void()>> dma_jobs;
     std::vector<int> dma_staged;
     for (size_t i = 0; i < miss_e.size(); ++i) {

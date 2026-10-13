@@ -57,6 +57,7 @@ struct LayerExperts {
     std::vector<uint32_t> last_miss_tok;      ///< per expert: 1 + the window of its last miss (0: never missed)
     std::vector<int32_t> loan_of;             ///< per expert: its loan slot on the device's loan pool, or -1 (the decode path's cache)
     std::vector<char> loan_live;              ///< per expert: the loan is in the device's slot table (a hit for both sides); set and cleared with the table
+    std::vector<uint8_t> loan_hits_n;         ///< per expert: hits on its loan so far (a promotion candidate past promote_hits_)
     int fd = -1;                              ///< the shard holding this layer's experts (pread for cold blobs)
     uint64_t off_gate = 0, off_up = 0, off_down = 0;   ///< file offsets of expert 0's rows
 };
@@ -161,6 +162,7 @@ public:
     void add_loan_region(int device_ordinal, uint8_t* base, size_t bytes, size_t skip);
     void finalize_loans();
     uint64_t loan_hits() const { return loan_hits_; }
+    uint64_t promotions() const { return promotions_; }   ///< loans swapped into resident slots
     uint64_t loans_made() const { return loans_made_; }
 
 private:
@@ -245,7 +247,8 @@ private:
     std::vector<std::deque<LoanBatch>> loan_batches_;              ///< per layer: in copy order
     std::vector<std::vector<void*>> loan_ev_pool_;                 ///< per device (events are device-bound)
     std::mutex loan_m_;
-    uint64_t loan_hits_ = 0, loans_made_ = 0;
+    uint64_t loan_hits_ = 0, loans_made_ = 0, promotions_ = 0;
+    int promote_hits_ = 0, promote_max_ = 2;   ///< a loan promoted after this many hits (0: never - the promotion thrashed and leaves the device table inconsistent across a prompt window; off until fixed); promotions per layer-window (STRATA_GLM5_PROMOTE_HITS / _MAX)
     static constexpr int kLoanApplyMax = 256;
     void init_loans(int n_layers);
     int loan_alloc(size_t di, int il, int e, uint32_t tok);        ///< a free or LRU loan slot (not one used in window tok), or -1
@@ -277,6 +280,9 @@ private:
     int y_rows_ = 64;             ///< the pinned result block's rows per layer (kMidCpuRows when the mid-size split is on)
     double file_ms_ = 0;
     int32_t pick_victim(LayerExperts& E, uint32_t tok, uint32_t protect);
+    /// a loan hit again inside the admission window: the expert swapped into a resident slot from its loan copy (the
+    /// swap the loan pre-empted; its copy on the copy stream before the layer's flag); true when done
+    bool promote_loan(LayerExperts& E, int il, size_t di, int e, uint32_t tok, int max_swaps, int& swapped, void* cs);
     void dma_miss(LayerExperts& E, int il, size_t di, size_t m, int e, uint32_t tok, int* miss_slot, int* miss_out, int max_swaps, int& swapped,
                   std::vector<std::function<void()>>& jobs, std::vector<int>& staged, void* cs);
     void finish_staged(LayerExperts& E, size_t di, int* miss_slot, std::vector<std::function<void()>>& jobs, std::vector<int>& staged, void* cs);

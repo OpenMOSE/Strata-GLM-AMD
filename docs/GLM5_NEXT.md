@@ -1094,3 +1094,22 @@ launch gaps.
   them). A drafts-per-round check on two prompts kept `--spec 2` (spec 1: 29.8 / 32.8, spec 2: 35.2 / 35.7, spec 3:
   33.4 / 35.7 tok/s).
 - Also: among misses with equal pair counts the one routed most often goes to the PCIe side (its blob becomes the loan).
+
+## Small gains, pass 5: loans on the plain serve path (2026-10-13)
+
+The plain serve path (the CPU service off: `STRATA_GLM5_CPU=0`, the slots-test's mode, a machine without the CPU
+path) made no loans: only the CPU-split path did. It makes them now, the same way (a staged miss also copied into a
+loan slot), with the one subtlety the first attempt missed: the host's hit test must count a live loan as a hit, because
+the device numbers the staging slots by its own table (which holds the loans) - counting it as a miss shifted every
+staging index and gave 50 mismatches in the slots-test. With that right the path is bit-identical (the 40-token
+decode's tokens equal to the build before) and the CPU-off decode goes 61.8 -> 44.5 ms/token (40 + 200), the slots-test's
+solo 82.8 -> 64.3 ms/token, two slots at 1 token per window 72.2 -> 53.2 ms/token. The batch rows lose a little there
+(53.5 -> 72.6 ms per window, hits 94.8 -> 90.4%): a loaned expert is never "missed again", so the admission filter never
+swaps it into residency, and the next prompt window drops the loans.
+
+A promotion was tried for that (a loan hit inside the admission window swapped into a resident slot from its loan copy):
+unlimited it thrashed (2,800 swaps per 200 tokens, 94 ms per round); gated by hit count it still left the device's table
+inconsistent across a prompt window in one path (a routing id of 2^31 - 1 in the second conversation of the slots-test).
+It stays in the code switched off (`STRATA_GLM5_PROMOTE_HITS`, default 0) until that is found. Also in this pass: a
+column-tile switch for the prompt WMMA kernel (`STRATA_GLM5_Q2K_NT`, 2 / 3 / 4), loan, promotion and copy counters on
+the CLI's last line.

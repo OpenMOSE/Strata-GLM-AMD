@@ -226,6 +226,8 @@ MoE と doorbell）、エキスパート階層と各方式の計測、MTP ドラ
 
 ## 更新内容
 
+- **2026-10-13 (夜)** - 小さな改善の第 5 回: decode 時の expert キャッシュを素の経路 (CPU 供給 off) でも: そのモードの decode 61.8 → 44.5
+  ms/token、slots-test の solo 82.8 → 64.3 ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。
 - **2026-10-13 (夕方)** - 小さな改善の第 4 回: 正確な融合をさらに 3 つ (swiglu + 量子化、combine を mHC の post-mix に、待ちと配置)、
   ミスの分担を再調整 (分担モデルの隠れる見込みを 0.4 / 0.4 ms に)、より多くのミスが PCIe 側へ行って貸出になる: ヒット 77 → 80%、
   decode ラウンドはプロンプトにより同じ〜5% 速い ([docs/GLM5_NEXT.md](docs/GLM5_NEXT.md))。
